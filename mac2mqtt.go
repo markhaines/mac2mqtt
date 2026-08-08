@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/mem" // Using v3 for current versions
@@ -28,6 +29,16 @@ import (
 	// Using my fork until #9 is resolved ( https://github.com/antonfisher/go-media-devices-state/pull/9 )
 	mediadevices "github.com/antonfisher/go-media-devices-state"
 )
+
+/*
+#cgo LDFLAGS: -framework CoreGraphics
+#include <CoreGraphics/CoreGraphics.h>
+
+static double macIdleSeconds(void) {
+	return CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGAnyInputEventType);
+}
+*/
+import "C"
 
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -118,6 +129,13 @@ type Application struct {
 	activityTimer     *time.Timer
 	lastCPU           sigar.Cpu // for CPU percentage calculation
 	cpuMutex          sync.RWMutex
+
+	// connectHandler runs on every MQTT reconnect, but these background
+	// workers must only ever exist once per process (see #12 for the last
+	// reconnect-path bug): without the guards each reconnect leaked another
+	// activity-monitor goroutine and another media-control subprocess.
+	activityMonitorStarted atomic.Bool
+	mediaStreamStarted     atomic.Bool
 }
 
 type config struct {
@@ -246,25 +264,34 @@ func (app *Application) getTopicPrefix() string {
 	return app.topic
 }
 
+var (
+	serialNumberOnce   sync.Once
+	serialNumberCached string
+)
+
 func getSerialnumber() string {
+	// The serial number is immutable, so query it once and cache it. Querying
+	// just IOPlatformExpertDevice avoids the previous full-registry dump
+	// (`ioreg -l`, tens of MB piped through grep) on every discovery publish.
+	serialNumberOnce.Do(func() {
+		cmd := "/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice | /usr/bin/grep IOPlatformSerialNumber"
+		output, err := exec.Command("/bin/sh", "-c", cmd).Output()
 
-	cmd := "/usr/sbin/ioreg -l | /usr/bin/grep IOPlatformSerialNumber"
-	output, err := exec.Command("/bin/sh", "-c", cmd).Output()
+		if err != nil {
+			log.Fatal(err)
+		}
+		outputStr := string(output)
+		last := output[strings.LastIndex(outputStr, " ")+1:]
+		lastStr := string(last)
+		// remove all symbols, but [a-zA-Z0-9_-]
+		reg, err := regexp.Compile("[^a-zA-Z0-9_-]+")
+		if err != nil {
+			log.Fatal(err)
+		}
+		serialNumberCached = reg.ReplaceAllString(lastStr, "")
+	})
 
-	if err != nil {
-		log.Fatal(err)
-	}
-	outputStr := string(output)
-	last := output[strings.LastIndex(outputStr, " ")+1:]
-	lastStr := string(last)
-	// remove all symbols, but [a-zA-Z0-9_-]
-	reg, err := regexp.Compile("[^a-zA-Z0-9_-]+")
-	if err != nil {
-		log.Fatal(err)
-	}
-	lastStr = reg.ReplaceAllString(lastStr, "")
-
-	return lastStr
+	return serialNumberCached
 }
 
 func getModel() string {
@@ -532,7 +559,6 @@ func getDisplays() []Display {
 		return nil
 	}
 
-	log.Println("Executing: betterdisplaycli get -identifiers")
 	out, err := exec.Command("betterdisplaycli", "get", "-identifiers").Output()
 	if err != nil {
 		log.Printf("Error getting displays: %v", err)
@@ -540,8 +566,6 @@ func getDisplays() []Display {
 		log.Println("Make sure BetterDisplay is running and CLI access is enabled")
 		return nil
 	}
-
-	log.Printf("BetterDisplay CLI output: %s", string(out))
 
 	// BetterDisplay CLI returns comma-separated JSON objects, not an array
 	// We need to wrap it in brackets to make it a valid JSON array
@@ -789,17 +813,26 @@ func (app *Application) startMediaStream(client mqtt.Client) {
 		return
 	}
 
+	// One stream per process: connectHandler calls this on every MQTT
+	// reconnect. The flag is released when the stream ends, so a later
+	// reconnect can restart a stream that has died.
+	if !app.mediaStreamStarted.CompareAndSwap(false, true) {
+		return
+	}
+
 	log.Println("Starting media-control stream for real-time updates...")
 
 	cmd := exec.Command("media-control", "stream")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Printf("Error creating stdout pipe for media stream: %v", err)
+		app.mediaStreamStarted.Store(false)
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("Error starting media-control stream: %v", err)
+		app.mediaStreamStarted.Store(false)
 		return
 	}
 
@@ -811,6 +844,7 @@ func (app *Application) startMediaStream(client mqtt.Client) {
 			}
 			cmd.Wait()
 			stdout.Close()
+			app.mediaStreamStarted.Store(false)
 		}()
 
 		scanner := bufio.NewScanner(stdout)
@@ -986,33 +1020,23 @@ func (app *Application) resetActivityTimer(client mqtt.Client) {
 	})
 }
 
-// getSystemIdleTime gets the system idle time in seconds
+// getSystemIdleTime gets the system idle time in seconds. It reads the HID
+// idle time natively via CoreGraphics; the previous implementation spawned an
+// `ioreg -c IOHIDSystem` subprocess per call, which at a 500ms cadence piled
+// up dozens of concurrent processes whenever the system was under load.
 func getSystemIdleTime() (int, error) {
-	cmd := exec.Command("ioreg", "-c", "IOHIDSystem")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("error running ioreg: %w", err)
-	}
-
-	// Parse the HIDIdleTime from the output
-	re := regexp.MustCompile(`"HIDIdleTime" = (\d+)`)
-	matches := re.FindStringSubmatch(string(output))
-	if len(matches) < 2 {
-		return 0, fmt.Errorf("HIDIdleTime not found in ioreg output")
-	}
-
-	idleTimeNanos, err := strconv.ParseInt(matches[1], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("error parsing idle time: %w", err)
-	}
-
-	// Convert nanoseconds to seconds
-	idleTimeSeconds := int(idleTimeNanos / 1000000000)
-	return idleTimeSeconds, nil
+	return int(C.macIdleSeconds()), nil
 }
 
 // startUserActivityMonitoring starts monitoring user activity using system idle time
 func (app *Application) startUserActivityMonitoring(client mqtt.Client) {
+	// connectHandler calls this on every MQTT reconnect, and the monitor loop
+	// below never exits; without a guard each reconnect leaked another
+	// polling goroutine for the life of the process.
+	if !app.activityMonitorStarted.CompareAndSwap(false, true) {
+		return
+	}
+
 	log.Println("Starting user activity monitoring...")
 
 	go func() {
@@ -1023,6 +1047,7 @@ func (app *Application) startUserActivityMonitoring(client mqtt.Client) {
 		}()
 
 		var lastIdleTime int = -1
+		var lastPublish time.Time
 
 		for {
 			// Check if client is still connected
@@ -1044,9 +1069,16 @@ func (app *Application) startUserActivityMonitoring(client mqtt.Client) {
 			}
 
 			lastIdleTime = idleTime
-			client.Publish(app.getTopicPrefix()+"/status/idle_time_seconds", 0, false, fmt.Sprintf("%d", idleTime))
-			// Check every 500ms for responsive detection
-			time.Sleep(500 * time.Millisecond)
+
+			// The idle-time sensor is informational; publishing every poll
+			// just churns MQTT and the HA recorder.
+			if time.Since(lastPublish) >= 10*time.Second {
+				client.Publish(app.getTopicPrefix()+"/status/idle_time_seconds", 0, false, fmt.Sprintf("%d", idleTime))
+				lastPublish = time.Now()
+			}
+
+			// The native idle read is cheap; 2s keeps detection responsive.
+			time.Sleep(2 * time.Second)
 		}
 	}()
 
