@@ -148,6 +148,26 @@ type config struct {
 	Topic            string `yaml:"mqtt_topic"`
 	DiscoveryPrefix  string `yaml:"discovery_prefix"`
 	IdleActivityTime int    `yaml:"idle_activity_time"` // in seconds
+
+	// Optional sensor switches. These are opt-OUT on purpose: the zero value
+	// of a bool is false, so a config that omits them keeps every sensor
+	// enabled and an existing install upgrading the binary sees no change.
+	DisableMediaDevices      bool `yaml:"disable_media_devices"`      // camera + microphone binary sensors
+	DisableDisplayBrightness bool `yaml:"disable_display_brightness"` // BetterDisplay brightness controls
+}
+
+// mediaDevicesEnabled reports whether the camera/microphone sensors should be
+// polled and published. Headless machines with no camera fail this poll every
+// cycle, so it can be switched off with disable_media_devices.
+func (app *Application) mediaDevicesEnabled() bool {
+	return app.config == nil || !app.config.DisableMediaDevices
+}
+
+// displayBrightnessEnabled reports whether the BetterDisplay brightness
+// controls should be discovered, polled and published. Servers with no display
+// worth controlling can switch this off with disable_display_brightness.
+func (app *Application) displayBrightnessEnabled() bool {
+	return app.config == nil || !app.config.DisableDisplayBrightness
 }
 
 func (c *config) getConfig() *config {
@@ -219,8 +239,12 @@ func NewApplication() (*Application, error) {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
 	}
 
-	// Initialize displays
-	app.displays = getDisplays()
+	// Initialize displays. When brightness is disabled we never shell out to
+	// betterdisplaycli at all, so app.displays stays nil and every downstream
+	// display code path (discovery, polling, commands) is a no-op.
+	if app.displayBrightnessEnabled() {
+		app.displays = getDisplays()
+	}
 
 	// Initialize currentMediaState
 	if isMediaControlAvailable() {
@@ -1118,6 +1142,10 @@ func (app *Application) publishMediaState(client mqtt.Client, state, title, arti
 
 // updateDisplayBrightness updates the MQTT topics with current display brightness values
 func (app *Application) updateDisplayBrightness(client mqtt.Client) {
+	if !app.displayBrightnessEnabled() {
+		return
+	}
+
 	// Skip if no displays are available
 	if len(app.displays) == 0 {
 		return
@@ -1391,6 +1419,13 @@ func (app *Application) handleSystemCommand(topic, payload string) bool {
 
 // handleDisplayBrightnessCommand handles display brightness commands
 func (app *Application) handleDisplayBrightnessCommand(client mqtt.Client, topic, payload string) bool {
+	// Brightness disabled: no brightness entity was ever discovered, so this
+	// can only be a stale retained command. Ignore it silently and let the
+	// remaining handlers see the topic.
+	if !app.displayBrightnessEnabled() {
+		return false
+	}
+
 	// Check if we have any displays available
 	if len(app.displays) == 0 {
 		log.Printf("Received display brightness command but no displays are available")
@@ -1740,6 +1775,10 @@ func getMediaDevicesState() (bool, bool, error) {
 }
 
 func (app *Application) updateMediaDevices(client mqtt.Client) {
+	if !app.mediaDevicesEnabled() {
+		return
+	}
+
 	isMicOn, isCameraOn, err := getMediaDevicesState()
 	if err != nil {
 		log.Printf("Failed to get media devices state: %v", err)
@@ -2096,9 +2135,22 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"memory_free_percent": memoryFreePercent,
 		"uptime_seconds":      uptimeSeconds,
 		"uptime_human":        uptimeHuman,
-		"microphone":          microphone,
-		"camera":              camera,
 		"public_ip":           publicIP,
+	}
+
+	// removed collects components that must be actively retired from Home
+	// Assistant. Per the MQTT device-discovery spec an omitted component is
+	// NOT deleted: it lingers as an orphaned entity. Publishing the component
+	// with only its platform key tells HA to remove it, so a config that
+	// switches a sensor off also cleans up the entity it used to create.
+	removed := map[string]interface{}{}
+
+	if app.mediaDevicesEnabled() {
+		components["microphone"] = microphone
+		components["camera"] = camera
+	} else {
+		removed["microphone"] = map[string]interface{}{"p": "binary_sensor"}
+		removed["camera"] = map[string]interface{}{"p": "binary_sensor"}
 	}
 
 	// Add user activity sensor
@@ -2153,7 +2205,8 @@ func (app *Application) setDevice(client mqtt.Client) {
 
 	// Note: Media player will be published as separate standard MQTT autodiscovery message
 
-	// Add display brightness controls for each display
+	// Add display brightness controls for each display. app.displays is empty
+	// when disable_display_brightness is set, so this loop yields nothing.
 	for _, display := range app.displays {
 		displayBrightness := map[string]interface{}{
 			"p":             "number",
@@ -2181,17 +2234,37 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"mdl":  getModel(),
 	}
 
-	object := map[string]interface{}{
-		"dev":                device,
-		"o":                  origin,
-		"cmps":               components,
-		"availability_topic": app.getTopicPrefix() + "/status/alive",
-		"qos":                2,
-	}
-	objectJSON, _ := json.Marshal(object)
+	discoveryTopic := app.config.DiscoveryPrefix + "/device" + "/" + app.hostname + "/config"
 
-	token := client.Publish(app.config.DiscoveryPrefix+"/device"+"/"+app.hostname+"/config", 0, true, objectJSON)
-	token.Wait()
+	publish := func(cmps map[string]interface{}) {
+		object := map[string]interface{}{
+			"dev":                device,
+			"o":                  origin,
+			"cmps":               cmps,
+			"availability_topic": app.getTopicPrefix() + "/status/alive",
+			"qos":                2,
+		}
+		objectJSON, _ := json.Marshal(object)
+
+		token := client.Publish(discoveryTopic, 0, true, objectJSON)
+		token.Wait()
+	}
+
+	if len(removed) > 0 {
+		// First send the live components plus the removal stubs so HA deletes
+		// the disabled entities, then re-send without the stubs so the
+		// retained discovery payload is clean for the next subscriber.
+		withRemovals := make(map[string]interface{}, len(components)+len(removed))
+		for k, v := range components {
+			withRemovals[k] = v
+		}
+		for k, v := range removed {
+			withRemovals[k] = v
+		}
+		publish(withRemovals)
+	}
+
+	publish(components)
 
 	// Note: Media player functionality replaced with play/pause button and now playing sensor
 }
@@ -2216,7 +2289,9 @@ func (app *Application) Run() error {
 
 	// Initialize displays before MQTT connection
 	log.Println("=== DISCOVERING DISPLAYS ===")
-	if len(app.displays) > 0 {
+	if !app.displayBrightnessEnabled() {
+		log.Println("Display brightness disabled by config (disable_display_brightness)")
+	} else if len(app.displays) > 0 {
 		log.Printf("Found %d display(s):", len(app.displays))
 		for _, display := range app.displays {
 			log.Printf("  - %s (ID: %s)", display.Name, display.DisplayID)
@@ -2225,6 +2300,10 @@ func (app *Application) Run() error {
 		log.Println("No displays found or BetterDisplay CLI not available")
 	}
 	log.Println("=== DISPLAY DISCOVERY COMPLETE ===")
+
+	if !app.mediaDevicesEnabled() {
+		log.Println("Camera/microphone sensors disabled by config (disable_media_devices)")
+	}
 
 	// Check Media Control availability
 	log.Println("=== CHECKING MEDIA CONTROL ===")

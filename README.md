@@ -75,6 +75,59 @@ Edit `mac2mqtt.yaml` (the sample file is in this repository), make binary execut
     2021/04/12 10:37:29 Connected to MQTT
     2021/04/12 10:37:29 Sending 'true' to topic: mac2mqtt/bessarabov-osx/status/alive
 
+### Configuration
+
+All settings live in `mac2mqtt.yaml`. Only `mqtt_ip` and `mqtt_port` are required.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `mqtt_ip` | required | Broker address |
+| `mqtt_port` | required | Broker port |
+| `mqtt_user` | empty | Broker username |
+| `mqtt_password` | empty | Broker password |
+| `mqtt_ssl` | `false` | Connect over TLS |
+| `hostname` | system hostname | Name used in topics and in Home Assistant |
+| `mqtt_topic` | `mac2mqtt` | Topic prefix, the hostname is appended to it |
+| `discovery_prefix` | `homeassistant` | Home Assistant discovery prefix |
+| `idle_activity_time` | `10` | Seconds of inactivity before user activity flips to inactive |
+| `disable_media_devices` | `false` | Switch off the camera and microphone sensors |
+| `disable_display_brightness` | `false` | Switch off the display brightness controls |
+
+#### Disabling sensors on headless and server installs
+
+`disable_media_devices` and `disable_display_brightness` exist for Macs that run
+as always-on servers: a machine in a rack with no camera, or one whose display is
+not worth controlling from Home Assistant. On those machines the two sensors poll
+hardware that is not really there, fail every cycle, and write a steady stream of
+errors into the log for no benefit.
+
+    # Headless server: no camera, and the display is not controlled from HA
+    disable_media_devices: true
+    disable_display_brightness: true
+
+`disable_media_devices: true` stops the camera and microphone from being polled
+and removes both binary sensors from Home Assistant.
+
+`disable_display_brightness: true` stops BetterDisplay CLI from being called at
+all. No display is enumerated at startup, no brightness is polled, and no
+brightness control is offered to Home Assistant.
+
+Both keys are optional and both default to `false`. **Omitting them keeps the
+current behaviour exactly**, so an existing installation can upgrade the binary
+without touching its config file and nothing changes.
+
+Everything else is unaffected in every configuration. In particular the
+availability topic `PREFIX/status/alive` and the command topic
+`PREFIX/command/set` (which carries `shutdown`) behave identically whether these
+sensors are on or off.
+
+When a sensor is switched off, mac2mqtt also tells Home Assistant to remove the
+entities it used to publish, so they are deleted rather than left behind showing
+as unavailable. Display brightness entities are the exception: because the
+display list is no longer queried, mac2mqtt cannot name them in order to retire
+them, so delete those entities once in Home Assistant after switching the sensor
+off.
+
 ### Running in the background
 
 You need `mac2mqtt.yaml` and `mac2mqtt` to be placed in the directory `/Users/USERNAME/mac2mqtt/`,
