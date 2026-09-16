@@ -118,15 +118,33 @@ without touching its config file and nothing changes.
 
 Everything else is unaffected in every configuration. In particular the
 availability topic `PREFIX/status/alive` and the command topic
-`PREFIX/command/set` (which carries `shutdown`) behave identically whether these
-sensors are on or off.
+`PREFIX/command/set` (which carries `shutdown`) are identical in content and in
+timing whether these sensors are on or off. On connect, the retained `online`
+message is published and `PREFIX/command/#` is subscribed *before* any discovery
+work, so a slow or failing discovery publish can never delay or suppress the
+availability signal or the shutdown path.
 
-When a sensor is switched off, mac2mqtt also tells Home Assistant to remove the
-entities it used to publish, so they are deleted rather than left behind showing
-as unavailable. Display brightness entities are the exception: because the
-display list is no longer queried, mac2mqtt cannot name them in order to retire
-them, so delete those entities once in Home Assistant after switching the sensor
-off.
+#### Removing entities that already exist
+
+A disabled sensor is left out of the discovery payload, so it is never created
+on a fresh install. It is **not** deleted automatically if a previous version of
+mac2mqtt already created it.
+
+This is a deliberate choice rather than an oversight. The discovery topic is
+retained, which means Home Assistant only ever sees the most recent payload.
+Publishing a removal instruction and then a clean payload would be honoured only
+if Home Assistant happened to be connected in the gap between the two, so it
+would work most of the time and silently fail the rest, which is worse than
+being told to do it yourself.
+
+So if you switch a sensor off on an installation that was already running it,
+delete the entities once by hand: **Settings > Devices & Services > MQTT**, pick
+the device, then delete the now-unavailable entities. This is a one-time step
+and they will not come back.
+
+This applies to both keys: `disable_media_devices` leaves a `Camera` and a
+`Microphone` binary sensor behind, and `disable_display_brightness` leaves one
+`<display> Brightness` number entity per display that was previously detected.
 
 ### Running in the background
 

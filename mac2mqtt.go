@@ -1186,14 +1186,19 @@ func (app *Application) messagePubHandler(client mqtt.Client, msg mqtt.Message) 
 func (app *Application) connectHandler(client mqtt.Client) {
 	log.Println("Connected to MQTT")
 
-	// Set up device configuration (in case this is a reconnection)
-	app.setDevice(client)
-
-	token := client.Publish(app.getTopicPrefix()+"/status/alive", 0, true, "online")
-	token.Wait()
-
-	log.Println("Sending 'online' to topic: " + app.getTopicPrefix() + "/status/alive")
+	// ORDERING IS LOAD BEARING. The retained availability message and the
+	// command subscription come first and are never gated on discovery.
+	// This topic is the only liveness signal some hosts give Home Assistant,
+	// and command/# carries the manual shutdown, so neither may wait behind a
+	// discovery publish that can block for the full 10s write timeout or fail
+	// outright against a slow or unhappy broker. setDevice is best effort and
+	// runs afterwards; whatever it does cannot delay or abort these two.
+	app.publishAlive(client)
 	app.sub(client, app.getTopicPrefix()+"/command/#")
+
+	// Set up device configuration (in case this is a reconnection). Best
+	// effort only: a failure here must never affect availability or commands.
+	app.setDevice(client)
 
 	// Start media stream if not already running (for reconnections)
 	if isMediaControlAvailable() {
@@ -1241,18 +1246,10 @@ func (app *Application) isNetworkReachable() bool {
 	return true
 }
 
-func (app *Application) getMQTTClientWithRetry(retryCount int) error {
-	// Prevent infinite recursion
-	if retryCount > MaxRetryAttempts {
-		return fmt.Errorf("failed to connect to MQTT broker after multiple attempts")
-	}
-
-	// Check network reachability first to avoid long timeouts
-	if !app.isNetworkReachable() {
-		log.Printf("MQTT broker is not reachable on current network, will retry later")
-		return fmt.Errorf("MQTT broker not reachable")
-	}
-
+// mqttClientOptions builds the broker options, including the last will that is
+// this host's death signal. Split out from the connect path so the will can be
+// asserted in tests without standing up a broker.
+func (app *Application) mqttClientOptions() *mqtt.ClientOptions {
 	opts := mqtt.NewClientOptions()
 
 	// Determine protocol and broker URL
@@ -1294,10 +1291,37 @@ func (app *Application) getMQTTClientWithRetry(retryCount int) error {
 	opts.SetWriteTimeout(10 * time.Second)         // Shorter write timeout for network issues
 	opts.SetResumeSubs(true)                       // Resume subscriptions on reconnect
 
-	// Set will message
+	// Set will message. This is the death signal: if this process dies without
+	// a clean disconnect, the broker publishes it retained on our behalf.
 	opts.SetWill(app.getTopicPrefix()+"/status/alive", "offline", 0, true)
 
-	client := mqtt.NewClient(opts)
+	return opts
+}
+
+// newMQTTClient builds the client from fully populated options. Paho copies
+// the options struct in NewClient, so construction must happen last; keeping
+// both steps in one place is what stops them drifting apart.
+func (app *Application) newMQTTClient() mqtt.Client {
+	return mqtt.NewClient(app.mqttClientOptions())
+}
+
+func (app *Application) getMQTTClientWithRetry(retryCount int) error {
+	// Prevent infinite recursion
+	if retryCount > MaxRetryAttempts {
+		return fmt.Errorf("failed to connect to MQTT broker after multiple attempts")
+	}
+
+	// Check network reachability first to avoid long timeouts
+	if !app.isNetworkReachable() {
+		log.Printf("MQTT broker is not reachable on current network, will retry later")
+		return fmt.Errorf("MQTT broker not reachable")
+	}
+
+	// Options are fully built before the client is constructed: Paho copies
+	// the options by value in NewClient, so anything set afterwards is
+	// silently ignored.
+	client := app.newMQTTClient()
+
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
 		// If SSL connection fails, try falling back to non-SSL
 		if app.config.SSL {
@@ -1310,6 +1334,30 @@ func (app *Application) getMQTTClientWithRetry(retryCount int) error {
 
 	app.client = client
 	return nil
+}
+
+// publishPeriodicStatus is the 60s tick body. The availability heartbeat at the
+// end of it is published in every configuration: disabling a sensor must never
+// stop this host telling Home Assistant it is alive.
+func (app *Application) publishPeriodicStatus(client mqtt.Client) {
+	app.updateVolume(client)
+	app.updateMute(client)
+	app.updateMediaDevices(client)
+	app.publishAlive(client)
+}
+
+// publishAlive publishes the retained availability message. It is deliberately
+// free of any dependency on sensor configuration or discovery state: every
+// configuration publishes exactly the same retained payload to the same topic.
+func (app *Application) publishAlive(client mqtt.Client) {
+	topic := app.getTopicPrefix() + "/status/alive"
+	token := client.Publish(topic, 0, true, "online")
+	token.Wait()
+	if err := token.Error(); err != nil {
+		log.Printf("Failed to publish availability to %s: %v", topic, err)
+		return
+	}
+	log.Println("Sending 'online' to topic: " + topic)
 }
 
 func (app *Application) sub(client mqtt.Client, topic string) {
@@ -1394,6 +1442,18 @@ func (app *Application) handleMuteCommand(client mqtt.Client, topic, payload str
 	return true
 }
 
+// The system command actions are reached through function variables so that
+// the dispatch from a command/set payload can be verified in tests without
+// actually sleeping or powering off the machine. Production behaviour is
+// unchanged: these point at the real implementations.
+var (
+	systemSleep        = commandSleep
+	systemDisplaySleep = commandDisplaySleep
+	systemDisplayWake  = commandDisplayWake
+	systemShutdown     = commandShutdown
+	systemScreensaver  = commandScreensaver
+)
+
 // handleSystemCommand handles system control commands
 func (app *Application) handleSystemCommand(topic, payload string) bool {
 	if topic != app.getTopicPrefix()+"/command/set" {
@@ -1402,15 +1462,15 @@ func (app *Application) handleSystemCommand(topic, payload string) bool {
 
 	switch payload {
 	case "sleep":
-		commandSleep()
+		systemSleep()
 	case "displaysleep":
-		commandDisplaySleep()
+		systemDisplaySleep()
 	case "displaywake":
-		commandDisplayWake()
+		systemDisplayWake()
 	case "shutdown":
-		commandShutdown()
+		systemShutdown()
 	case "screensaver":
-		commandScreensaver()
+		systemScreensaver()
 	default:
 		log.Printf("Unknown system command: %s", payload)
 	}
@@ -2138,19 +2198,17 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"public_ip":           publicIP,
 	}
 
-	// removed collects components that must be actively retired from Home
-	// Assistant. Per the MQTT device-discovery spec an omitted component is
-	// NOT deleted: it lingers as an orphaned entity. Publishing the component
-	// with only its platform key tells HA to remove it, so a config that
-	// switches a sensor off also cleans up the entity it used to create.
-	removed := map[string]interface{}{}
-
+	// A disabled sensor is simply left out of the discovery payload, so it is
+	// never created. Retiring an entity that a previous version already
+	// created is NOT attempted here: the discovery topic is retained, so a
+	// Home Assistant that is offline while we publish only ever sees the last
+	// payload. A removal stub followed by a clean payload would therefore be
+	// honoured only if HA happened to be listening in between, which is the
+	// appearance of cleanup rather than the guarantee of it. Orphan removal is
+	// a documented one-time manual step instead; see the README.
 	if app.mediaDevicesEnabled() {
 		components["microphone"] = microphone
 		components["camera"] = camera
-	} else {
-		removed["microphone"] = map[string]interface{}{"p": "binary_sensor"}
-		removed["camera"] = map[string]interface{}{"p": "binary_sensor"}
 	}
 
 	// Add user activity sensor
@@ -2206,8 +2264,13 @@ func (app *Application) setDevice(client mqtt.Client) {
 	// Note: Media player will be published as separate standard MQTT autodiscovery message
 
 	// Add display brightness controls for each display. app.displays is empty
-	// when disable_display_brightness is set, so this loop yields nothing.
-	for _, display := range app.displays {
+	// when disable_display_brightness is set; the explicit guard means a stale
+	// display list can never reintroduce the entity either.
+	displays := app.displays
+	if !app.displayBrightnessEnabled() {
+		displays = nil
+	}
+	for _, display := range displays {
 		displayBrightness := map[string]interface{}{
 			"p":             "number",
 			"name":          display.Name + " Brightness",
@@ -2236,35 +2299,28 @@ func (app *Application) setDevice(client mqtt.Client) {
 
 	discoveryTopic := app.config.DiscoveryPrefix + "/device" + "/" + app.hostname + "/config"
 
-	publish := func(cmps map[string]interface{}) {
-		object := map[string]interface{}{
-			"dev":                device,
-			"o":                  origin,
-			"cmps":               cmps,
-			"availability_topic": app.getTopicPrefix() + "/status/alive",
-			"qos":                2,
-		}
-		objectJSON, _ := json.Marshal(object)
-
-		token := client.Publish(discoveryTopic, 0, true, objectJSON)
-		token.Wait()
+	object := map[string]interface{}{
+		"dev":                device,
+		"o":                  origin,
+		"cmps":               components,
+		"availability_topic": app.getTopicPrefix() + "/status/alive",
+		"qos":                2,
+	}
+	objectJSON, err := json.Marshal(object)
+	if err != nil {
+		log.Printf("Failed to encode discovery config: %v", err)
+		return
 	}
 
-	if len(removed) > 0 {
-		// First send the live components plus the removal stubs so HA deletes
-		// the disabled entities, then re-send without the stubs so the
-		// retained discovery payload is clean for the next subscriber.
-		withRemovals := make(map[string]interface{}, len(components)+len(removed))
-		for k, v := range components {
-			withRemovals[k] = v
-		}
-		for k, v := range removed {
-			withRemovals[k] = v
-		}
-		publish(withRemovals)
+	// QoS 1 with a checked token: this payload is what creates and removes
+	// entities in Home Assistant, so a silently dropped publish leaves the
+	// registry disagreeing with the config. Failure is logged and tolerated,
+	// never fatal, because availability and commands do not depend on it.
+	token := client.Publish(discoveryTopic, 1, true, objectJSON)
+	token.Wait()
+	if err := token.Error(); err != nil {
+		log.Printf("Failed to publish discovery config to %s: %v", discoveryTopic, err)
 	}
-
-	publish(components)
 
 	// Note: Media player functionality replaced with play/pause button and now playing sensor
 }
@@ -2375,10 +2431,7 @@ func (app *Application) Run() error {
 		case <-volumeTicker.C:
 			// Check if client is connected before publishing
 			if app.isClientConnected() {
-				app.updateVolume(app.client)
-				app.updateMute(app.client)
-				app.updateMediaDevices(app.client)
-				app.client.Publish(app.getTopicPrefix()+"/status/alive", 0, true, "online")
+				app.publishPeriodicStatus(app.client)
 			} else if networkReachable {
 				log.Println("MQTT client not connected but network is reachable, connection may be recovering")
 			}
