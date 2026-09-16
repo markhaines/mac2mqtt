@@ -427,3 +427,74 @@ To build this program yourself, follow these steps:
 4. Build with `go build mac2mqtt.go`
 
 It outputs a file `mac2mqtt`. Make the binary executable (`chmod +x mac2mqtt`) and run `./mac2mqtt`.
+
+### Local build and signing
+
+`make build` (and `build-amd64` / `build-arm64`) signs the binary with a stable
+code identity when one is available. CI (`gh-build`, the GitHub workflows) is
+unchanged.
+
+**Why.** macOS Local Network Privacy ties its approval to the binary's code
+identity. The Go linker ad-hoc signs everything as `a.out` with no Team ID, so
+each rebuild looks like a new app: `nehelper` logs `Local network allowed by
+preference for mac2mqtt (a.out), but received prompt`, and LAN connects fail
+with `errno 65` (no route to host) until someone approves at the screen. On a
+headless Mac that means the MQTT connection, and the Home Assistant alive
+signal, stays down.
+
+**Toolchain workaround.** If cgo cannot find a working SDK (a broken or
+mismatched Xcode selection), point the build at the Command Line Tools for that
+one command. Do not change `xcode-select`:
+
+```bash
+CC=/Library/Developer/CommandLineTools/usr/bin/clang \
+CGO_CFLAGS="-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk" \
+CGO_LDFLAGS="-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk" \
+make build
+```
+
+**One-time signing setup.** The Makefile expects:
+
+| Variable | Default |
+|---|---|
+| `CODESIGN_IDENTITY` | `mac2mqtt Local Dev` (set empty to skip signing) |
+| `CODESIGN_IDENTIFIER` | `com.markhaines.mac2mqtt` |
+| `CODESIGN_KEYCHAIN` | `~/Library/Keychains/mac2mqtt-signing.keychain-db` |
+| `CODESIGN_KEYCHAIN_SERVICE` | `mac2mqtt-signing-keychain` (login keychain item holding the keychain password) |
+| `CODESIGN_KEYCHAIN_ACCOUNT` | `$USER` |
+
+1. Create a self-signed certificate with `openssl`: CN `mac2mqtt Local Dev`,
+   `extendedKeyUsage=codeSigning`, `keyUsage=digitalSignature`,
+   `basicConstraints=CA:false`, 10-year validity. Export key and cert as a
+   `.p12` (use `-certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1` so
+   `security import` accepts it).
+2. Store a random password for the signing keychain in the login keychain:
+   `security add-generic-password -s mac2mqtt-signing-keychain -a "$USER" -w "$PW" -T /usr/bin/security`.
+3. Create a **dedicated** keychain and import into it, never into
+   `login.keychain-db` (on a headless Mac a login-keychain ACL prompt makes
+   `codesign` hang on a dialog nobody can click):
+   ```bash
+   KC=~/Library/Keychains/mac2mqtt-signing.keychain-db
+   security create-keychain -p "$PW" "$KC"
+   security set-keychain-settings "$KC"          # no auto-lock timeout
+   security unlock-keychain -p "$PW" "$KC"
+   security import cs.p12 -k "$KC" -P "$P12PW" -T /usr/bin/codesign
+   security set-key-partition-list -S apple-tool:,apple: -s -k "$PW" "$KC"
+   ```
+4. Delete the key, cert and `.p12` files.
+
+There is no need to add the keychain to the search list: the Makefile passes
+`codesign --keychain`. A self-signed certificate reports
+`CSSMERR_TP_NOT_TRUSTED`, so `security find-identity -v` shows 0 valid
+identities. That is expected; `codesign` still signs with it.
+
+After signing, the Makefile checks `codesign -dvvv` for
+`Authority=mac2mqtt Local Dev` and `Identifier=com.markhaines.mac2mqtt` and
+fails the build if either is missing. If the keychain, password item or
+identity is absent it prints a warning and leaves the binary ad-hoc signed.
+
+**Local Network approval.** The first deploy of a signed binary is a new
+identity, so it needs one approval at the screen (System Settings, Privacy &
+Security, Local Network). Later builds signed with the same identity carry the
+same designated requirement (`codesign -d -r- mac2mqtt`) and should keep that
+approval.
