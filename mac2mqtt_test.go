@@ -853,36 +853,29 @@ func loadLegacyFixture(t *testing.T, variant string) legacyFixture {
 	return f
 }
 
-// pinMediaControl forces both media-control seams for the duration of a test,
-// so the comparison depends on the fixture rather than on what happens to be
-// installed on the machine running it.
+// pinMediaControl fixes both media-control seams on one Application, so the
+// comparison depends on the fixture rather than on what happens to be installed
+// on the machine running it.
 //
 // Pinning the probe alone is not enough: the connect path also reads the
 // current media state, which really does execute the media-control binary. On a
 // machine without it that read fails and a different set of topics is
 // published, so the media state is pinned too. The fixtures were captured with
 // no media playing, which is what the nil return reproduces.
-func pinMediaControl(t *testing.T, available bool) {
-	t.Helper()
-
-	mediaSeamMu.Lock()
-	originalProbe := mediaControlAvailableFn
-	originalInfo := mediaInfoSourceFn
-	mediaControlAvailableFn = func() bool { return available }
-	mediaInfoSourceFn = func() (*MediaInfo, error) {
+//
+// The seams are per-Application, so this must be called on a freshly built app
+// before anything reads them, and nothing is restored afterwards: each test
+// owns its own instance. That is what keeps the goroutines connectHandler
+// starts from ever racing a test that is tidying up.
+func pinMediaControl(app *Application, available bool) *Application {
+	app.mediaControlFn = func() bool { return available }
+	app.mediaInfoFn = func() (*MediaInfo, error) {
 		if !available {
 			return nil, &MediaControlError{message: "media-control is not installed"}
 		}
 		return nil, nil // installed, nothing playing
 	}
-	mediaSeamMu.Unlock()
-
-	t.Cleanup(func() {
-		mediaSeamMu.Lock()
-		mediaControlAvailableFn = originalProbe
-		mediaInfoSourceFn = originalInfo
-		mediaSeamMu.Unlock()
-	})
+	return app
 }
 
 // legacyVariants is the matrix every fixture-backed test runs over. Both run
@@ -1044,10 +1037,10 @@ func TestDefaultPathMatchesLegacyOnWireBehaviour(t *testing.T) {
 	for _, v := range legacyVariants() {
 		t.Run(v.name, func(t *testing.T) {
 			f := loadLegacyFixture(t, v.name)
-			pinMediaControl(t, v.available)
 
 			c := &fakeClient{}
-			connectTestApp(parseConfig(t, "")).connectHandler(c)
+			app := pinMediaControl(connectTestApp(parseConfig(t, "")), v.available)
+			app.connectHandler(c)
 
 			var got []legacyOp
 			for _, o := range c.snapshot() {
@@ -1066,10 +1059,10 @@ func TestDefaultDiscoveryPayloadMatchesLegacy(t *testing.T) {
 	for _, v := range legacyVariants() {
 		t.Run(v.name, func(t *testing.T) {
 			f := loadLegacyFixture(t, v.name)
-			pinMediaControl(t, v.available)
 
 			c := &fakeClient{}
-			testApp(parseConfig(t, "")).setDevice(c)
+			app := pinMediaControl(testApp(parseConfig(t, "")), v.available)
+			app.setDevice(c)
 
 			var payload []byte
 			for _, o := range c.snapshot() {

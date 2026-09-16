@@ -86,39 +86,6 @@ func isMediaControlAvailable() bool {
 	return err == nil
 }
 
-// The two media-control seams. These exist so that tests can pin what would
-// otherwise be ambient environment: whether the media-control binary is
-// installed, and what it reports. That is what lets the compatibility
-// comparison run on a machine with media-control and on one without, rather
-// than being skipped on either. Production always uses the real
-// implementations, set here and never reassigned.
-//
-// They are read through the functions below rather than called directly,
-// because connectHandler starts background goroutines that read them while a
-// test may be restoring them. The mutex makes that safe; the read is an
-// uncontended RLock on paths that already spawn subprocesses.
-var (
-	mediaSeamMu             sync.RWMutex
-	mediaControlAvailableFn = isMediaControlAvailable
-	mediaInfoSourceFn       = getMediaInfo
-)
-
-// mediaControlAvailable reports whether the media-control binary is installed.
-func mediaControlAvailable() bool {
-	mediaSeamMu.RLock()
-	fn := mediaControlAvailableFn
-	mediaSeamMu.RUnlock()
-	return fn()
-}
-
-// mediaInfoSource reads the current media state.
-func mediaInfoSource() (*MediaInfo, error) {
-	mediaSeamMu.RLock()
-	fn := mediaInfoSourceFn
-	mediaSeamMu.RUnlock()
-	return fn()
-}
-
 // MediaInfo represents the current media playing information
 type MediaInfo struct {
 	Title       string `json:"title"`
@@ -169,6 +136,36 @@ type Application struct {
 	// activity-monitor goroutine and another media-control subprocess.
 	activityMonitorStarted atomic.Bool
 	mediaStreamStarted     atomic.Bool
+
+	// Media-control seams. These exist so tests can pin what would otherwise
+	// be ambient environment: whether the media-control binary is installed,
+	// and what it reports. That is what lets the compatibility comparison run
+	// on a machine with media-control and on one without, rather than being
+	// skipped on either.
+	//
+	// They are per-Application and are set at construction, before any of the
+	// goroutines that read them exist, and never reassigned afterwards. That
+	// ordering is what makes them safe without synchronisation: goroutine
+	// creation establishes the happens-before edge. A nil field means "use the
+	// real implementation", so a zero-value Application behaves normally.
+	mediaControlFn func() bool
+	mediaInfoFn    func() (*MediaInfo, error)
+}
+
+// mediaControlAvailable reports whether the media-control binary is installed.
+func (app *Application) mediaControlAvailable() bool {
+	if app.mediaControlFn != nil {
+		return app.mediaControlFn()
+	}
+	return isMediaControlAvailable()
+}
+
+// mediaInfoSource reads the current media state.
+func (app *Application) mediaInfoSource() (*MediaInfo, error) {
+	if app.mediaInfoFn != nil {
+		return app.mediaInfoFn()
+	}
+	return getMediaInfo()
 }
 
 type config struct {
@@ -280,8 +277,8 @@ func NewApplication() (*Application, error) {
 	}
 
 	// Initialize currentMediaState
-	if mediaControlAvailable() {
-		mediaInfo, err := mediaInfoSource()
+	if app.mediaControlAvailable() {
+		mediaInfo, err := app.mediaInfoSource()
 		if err == nil && mediaInfo != nil {
 			app.currentMediaState = *mediaInfo
 		} else {
@@ -690,7 +687,7 @@ func setDisplayBrightness(displayID string, brightness int) error {
 // getMediaInfo retrieves current media information using Media Control
 func getMediaInfo() (*MediaInfo, error) {
 	// Check if Media Control is available
-	if !mediaControlAvailable() {
+	if !isMediaControlAvailable() {
 		return nil, &MediaControlError{message: "Media Control is not installed or not accessible"}
 	}
 
@@ -767,7 +764,7 @@ func getMediaInfo() (*MediaInfo, error) {
 
 // updateMediaPlayer updates the MQTT topics with current media player information
 func (app *Application) updateMediaPlayer(client mqtt.Client) {
-	mediaInfo, err := mediaInfoSource()
+	mediaInfo, err := app.mediaInfoSource()
 	if err != nil {
 		// Check if it's a Media Control error
 		if _, ok := err.(*MediaControlError); ok {
@@ -806,7 +803,7 @@ func (app *Application) updateMediaPlayer(client mqtt.Client) {
 
 // updateNowPlaying updates the now playing sensor with current media information
 func (app *Application) updateNowPlaying(client mqtt.Client) {
-	mediaInfo, err := mediaInfoSource()
+	mediaInfo, err := app.mediaInfoSource()
 	if err != nil {
 		if _, ok := err.(*MediaControlError); ok {
 			log.Printf("Media Control is not available: %v", err)
@@ -865,7 +862,7 @@ func (app *Application) updateNowPlaying(client mqtt.Client) {
 
 // startMediaStream starts the media-control stream for real-time updates
 func (app *Application) startMediaStream(client mqtt.Client) {
-	if !mediaControlAvailable() {
+	if !app.mediaControlAvailable() {
 		log.Println("Media Control not available - skipping media stream")
 		return
 	}
@@ -1234,7 +1231,7 @@ func (app *Application) connectHandler(client mqtt.Client) {
 	app.setDevice(client)
 
 	// Start media stream if not already running (for reconnections)
-	if mediaControlAvailable() {
+	if app.mediaControlAvailable() {
 		go app.startMediaStream(client)
 	}
 
@@ -2283,7 +2280,7 @@ func (app *Application) setDevice(client mqtt.Client) {
 	components["idle_time_seconds"] = idleTime
 
 	// Add media control components if Media Control is available
-	if mediaControlAvailable() {
+	if app.mediaControlAvailable() {
 		playPause := map[string]interface{}{
 			"p":             "button",
 			"name":          "Play/Pause",
@@ -2417,7 +2414,7 @@ func (app *Application) Run() error {
 
 	// Check Media Control availability
 	log.Println("=== CHECKING MEDIA CONTROL ===")
-	if mediaControlAvailable() {
+	if app.mediaControlAvailable() {
 		log.Println("Media Control is available - Media player will be enabled")
 	} else {
 		log.Println("Media Control is not installed or not accessible")
