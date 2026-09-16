@@ -53,7 +53,6 @@ const (
 	MinVolume              = 0
 	MaxBrightness          = 100
 	MinBrightness          = 0
-	MaxRetryAttempts       = 1
 
 	// NetworkCheckInterval is how often the main loop probes the broker. It is
 	// also the loop that recovers from an offline start, see networkCheck.
@@ -68,6 +67,13 @@ const (
 	// doubles up to StartupRetryMaxBackoff.
 	StartupRetryInitialBackoff = 2 * time.Second
 	StartupRetryMaxBackoff     = 15 * time.Second
+	// StartupConnectWait bounds how long startup waits for the first MQTT
+	// connect to complete once the broker is reachable. It covers one full
+	// connect attempt (the 15s ConnectTimeout in mqttClientOptions) so a
+	// healthy broker is always connected before the main loop starts, exactly
+	// as before. Past it, startup carries on and Paho keeps connecting in the
+	// background; see getMQTTClient.
+	StartupConnectWait = 20 * time.Second
 )
 
 // BetterDisplayCLIError represents an error when BetterDisplay CLI is not available
@@ -187,6 +193,14 @@ type Application struct {
 	// StartupRetryInitialBackoff; tests shrink them.
 	startupRetryBudget  time.Duration
 	startupRetryBackoff time.Duration
+
+	// Main-loop seams. startupConnectWait zero means StartupConnectWait and
+	// networkCheckInterval zero means NetworkCheckInterval; tests shrink them.
+	// stop, when closed, makes Run return; nil (production) never fires. All
+	// are set before Run starts and never reassigned.
+	startupConnectWait   time.Duration
+	networkCheckInterval time.Duration
+	stop                 <-chan struct{}
 
 	// initialSetupPending is set when the client is created by the offline
 	// recovery path rather than by a healthy startup, so the one-off initial
@@ -1337,10 +1351,6 @@ func (app *Application) connectLostHandler(_ mqtt.Client, err error) {
 	}
 }
 
-func (app *Application) getMQTTClient() error {
-	return app.getMQTTClientWithRetry(0)
-}
-
 // isNetworkReachable checks if the MQTT broker is reachable before attempting connection
 func (app *Application) isNetworkReachable() bool {
 	if app.reachableFn != nil {
@@ -1418,12 +1428,26 @@ func (app *Application) newMQTTClient() mqtt.Client {
 	return mqtt.NewClient(app.mqttClientOptions())
 }
 
-func (app *Application) getMQTTClientWithRetry(retryCount int) error {
-	// Prevent infinite recursion
-	if retryCount > MaxRetryAttempts {
-		return fmt.Errorf("failed to connect to MQTT broker after multiple attempts")
-	}
-
+// getMQTTClient installs the one MQTT client and starts it connecting.
+//
+// It waits at most StartupConnectWait for the first connect, never
+// indefinitely. With ConnectRetry set (see mqttClientOptions) Paho's connect
+// token only completes on success or after Disconnect, so an unbounded wait
+// hangs startup forever on a broker that accepts TCP but never completes the
+// MQTT connect: a stalled CONNACK, rejected credentials, a TLS mismatch. A
+// healthy broker completes well inside the bound, so startup is as before:
+// connected on return, and Run makes the initial publishes straight away. If
+// the wait runs out, the client stays installed and keeps connecting in Paho's
+// own retry loop, the one-off initial setup is left pending for the main loop
+// (as for a recovered offline start), and startup returns so the loop, its
+// timers and networkCheck run. connectHandler runs whenever the connect
+// succeeds, as on every connect.
+//
+// mqtt_ssl means TLS only. There used to be a fallback here that retried over
+// plain TCP when the TLS connect failed, but it sat behind the unbounded wait
+// and so could never run; it is removed rather than revived, because reviving
+// it would start sending credentials in plaintext.
+func (app *Application) getMQTTClient() error {
 	// Check network reachability first to avoid long timeouts
 	if !app.isNetworkReachable() {
 		log.Printf("MQTT broker is not reachable on current network, will retry later")
@@ -1434,15 +1458,22 @@ func (app *Application) getMQTTClientWithRetry(retryCount int) error {
 	// the options by value in NewClient, so anything set afterwards is
 	// silently ignored.
 	client := app.newMQTTClient()
+	token := client.Connect()
 
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		// If SSL connection fails, try falling back to non-SSL
-		if app.config.SSL {
-			log.Printf("SSL connection failed: %v. Trying non-SSL connection...", token.Error())
-			app.config.SSL = false
-			return app.getMQTTClientWithRetry(retryCount + 1)
-		}
-		return fmt.Errorf("failed to connect to MQTT broker: %w", token.Error())
+	wait := app.startupConnectWait
+	if wait <= 0 {
+		wait = StartupConnectWait
+	}
+	if !token.WaitTimeout(wait) {
+		log.Printf("MQTT connect not complete after %v - continuing startup, the client keeps connecting in the background", wait)
+		app.client = client
+		app.initialSetupPending = true
+		return nil
+	}
+	if err := token.Error(); err != nil {
+		// Only reachable if the connect was abandoned (Disconnect); the client
+		// is finished, so it is not installed.
+		return fmt.Errorf("failed to connect to MQTT broker: %w", err)
 	}
 
 	app.client = client
@@ -2514,10 +2545,14 @@ func (app *Application) Run() error {
 	}
 
 	// Set up tickers for periodic updates
+	networkCheckInterval := app.networkCheckInterval
+	if networkCheckInterval <= 0 {
+		networkCheckInterval = NetworkCheckInterval
+	}
 	volumeTicker := time.NewTicker(UpdateInterval)
 	batteryTicker := time.NewTicker(UpdateInterval)
 	awakeTicker := time.NewTicker(UpdateInterval)
-	networkCheckTicker := time.NewTicker(NetworkCheckInterval)
+	networkCheckTicker := time.NewTicker(networkCheckInterval)
 	defer volumeTicker.Stop()
 	defer batteryTicker.Stop()
 	defer awakeTicker.Stop()
@@ -2571,12 +2606,17 @@ func (app *Application) Run() error {
 		case <-networkCheckTicker.C:
 			app.runPendingInitialSetup()
 			app.networkCheck(&conn)
+
+		case <-app.stop:
+			return nil
 		}
 	}
 }
 
-// connectAtStartup makes the startup connection. A broker that is reachable
-// but refuses the connection is fatal, as before. An unreachable one is not:
+// connectAtStartup makes the startup connection. It waits on the MQTT connect
+// for a bounded time only (see getMQTTClient): a reachable broker gets its
+// client, connected or still connecting. getMQTTClient failing while the broker
+// probes reachable is fatal, as before. An unreachable one is not:
 // it gets a bounded grace period, and if it is still unreachable after that the
 // process carries on in offline mode and networkCheck recovers it later.
 func (app *Application) connectAtStartup() error {
@@ -2741,8 +2781,16 @@ func (app *Application) networkCheck(st *connectivityState) {
 // During offline mode (broker unreachable at startup) app.client is nil, so
 // callers must use this instead of dereferencing app.client directly to avoid
 // a nil-pointer panic.
+//
+// It asks IsConnectionOpen, not IsConnected. With ConnectRetry set, Paho's
+// IsConnected also reports true while the first connect is still in progress,
+// and a QoS 0 publish made then returns a token that is never completed, so
+// every publisher that waits on its token (updateVolume, setDevice and the
+// rest) would block the main loop until the broker accepted. Once connected the
+// two agree; during an automatic reconnect Paho drops QoS 0 publishes without
+// sending them anyway, so skipping them then changes nothing on the wire.
 func (app *Application) isClientConnected() bool {
-	return app.client != nil && app.client.IsConnected()
+	return app.client != nil && app.client.IsConnectionOpen()
 }
 
 // Input validation functions
