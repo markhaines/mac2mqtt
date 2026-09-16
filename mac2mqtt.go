@@ -54,6 +54,20 @@ const (
 	MaxBrightness          = 100
 	MinBrightness          = 0
 	MaxRetryAttempts       = 1
+
+	// NetworkCheckInterval is how often the main loop probes the broker. It is
+	// also the loop that recovers from an offline start, see networkCheck.
+	NetworkCheckInterval = 30 * time.Second
+	// NetworkProbeTimeout bounds a single reachability dial.
+	NetworkProbeTimeout = 5 * time.Second
+	// StartupRetryBudget bounds how long startup keeps re-probing an
+	// unreachable broker before giving up and entering offline mode. Startup
+	// may overrun it by at most one NetworkProbeTimeout, never more.
+	StartupRetryBudget = 60 * time.Second
+	// StartupRetryInitialBackoff is the first gap between startup probes; it
+	// doubles up to StartupRetryMaxBackoff.
+	StartupRetryInitialBackoff = 2 * time.Second
+	StartupRetryMaxBackoff     = 15 * time.Second
 )
 
 // BetterDisplayCLIError represents an error when BetterDisplay CLI is not available
@@ -150,6 +164,70 @@ type Application struct {
 	// real implementation", so a zero-value Application behaves normally.
 	mediaControlFn func() bool
 	mediaInfoFn    func() (*MediaInfo, error)
+
+	// Broker seams, under the same rules as the media-control ones: set at
+	// construction, never reassigned, nil means the real implementation.
+	// reachableFn replaces the TCP probe and newClientFn replaces
+	// mqtt.NewClient, which is what lets the offline-start recovery be driven
+	// in a test without a network.
+	reachableFn func() bool
+	newClientFn func(*mqtt.ClientOptions) mqtt.Client
+
+	// Host-state seams for everything the connect path reads by shelling out
+	// (osascript, ps, ioreg, system_profiler), under the same rules again. They
+	// let a test run connectHandler without any host command, so its timing
+	// does not depend on PATH or machine load.
+	volumeFn       func() int
+	muteFn         func() bool
+	caffeinateFn   func() bool
+	serialNumberFn func() string
+	modelFn        func() string
+
+	// Startup retry timing. Zero means StartupRetryBudget and
+	// StartupRetryInitialBackoff; tests shrink them.
+	startupRetryBudget  time.Duration
+	startupRetryBackoff time.Duration
+
+	// initialSetupPending is set when the client is created by the offline
+	// recovery path rather than by a healthy startup, so the one-off initial
+	// publishes a healthy startup makes still happen once it connects. It is
+	// only ever touched by the goroutine running Run, like app.client.
+	initialSetupPending bool
+}
+
+func (app *Application) currentVolume() int {
+	if app.volumeFn != nil {
+		return app.volumeFn()
+	}
+	return getCurrentVolume()
+}
+
+func (app *Application) muteStatus() bool {
+	if app.muteFn != nil {
+		return app.muteFn()
+	}
+	return getMuteStatus()
+}
+
+func (app *Application) caffeinateStatus() bool {
+	if app.caffeinateFn != nil {
+		return app.caffeinateFn()
+	}
+	return getCaffeinateStatus()
+}
+
+func (app *Application) serialNumber() string {
+	if app.serialNumberFn != nil {
+		return app.serialNumberFn()
+	}
+	return getSerialnumber()
+}
+
+func (app *Application) model() string {
+	if app.modelFn != nil {
+		return app.modelFn()
+	}
+	return getModel()
 }
 
 // mediaControlAvailable reports whether the media-control binary is installed.
@@ -1265,9 +1343,11 @@ func (app *Application) getMQTTClient() error {
 
 // isNetworkReachable checks if the MQTT broker is reachable before attempting connection
 func (app *Application) isNetworkReachable() bool {
+	if app.reachableFn != nil {
+		return app.reachableFn()
+	}
 	// Try to connect to the broker with a short timeout
-	timeout := 5 * time.Second
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(app.config.IP, app.config.Port), timeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(app.config.IP, app.config.Port), NetworkProbeTimeout)
 	if err != nil {
 		log.Printf("Network check failed: MQTT broker %s:%s is not reachable (%v)", app.config.IP, app.config.Port, err)
 		return false
@@ -1332,6 +1412,9 @@ func (app *Application) mqttClientOptions() *mqtt.ClientOptions {
 // the options struct in NewClient, so construction must happen last; keeping
 // both steps in one place is what stops them drifting apart.
 func (app *Application) newMQTTClient() mqtt.Client {
+	if app.newClientFn != nil {
+		return app.newClientFn(app.mqttClientOptions())
+	}
 	return mqtt.NewClient(app.mqttClientOptions())
 }
 
@@ -1615,12 +1698,12 @@ func (app *Application) handlePlayPauseCommand(client mqtt.Client, topic, payloa
 }
 
 func (app *Application) updateVolume(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/volume", 0, false, strconv.Itoa(getCurrentVolume()))
+	token := client.Publish(app.getTopicPrefix()+"/status/volume", 0, false, strconv.Itoa(app.currentVolume()))
 	token.Wait()
 }
 
 func (app *Application) updateMute(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/mute", 0, false, strconv.FormatBool(getMuteStatus()))
+	token := client.Publish(app.getTopicPrefix()+"/status/mute", 0, false, strconv.FormatBool(app.muteStatus()))
 	token.Wait()
 }
 
@@ -1804,7 +1887,7 @@ func (app *Application) updateBattery(client mqtt.Client) {
 }
 
 func (app *Application) updateCaffeinateStatus(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/caffeinate", 0, false, strconv.FormatBool(getCaffeinateStatus()))
+	token := client.Publish(app.getTopicPrefix()+"/status/caffeinate", 0, false, strconv.FormatBool(app.caffeinateStatus()))
 	token.Wait()
 }
 
@@ -2333,10 +2416,10 @@ func (app *Application) setDevice(client mqtt.Client) {
 	}
 
 	device := map[string]interface{}{
-		"ids":  getSerialnumber(),
+		"ids":  app.serialNumber(),
 		"name": app.hostname,
 		"mf":   "Apple",
-		"mdl":  getModel(),
+		"mdl":  app.model(),
 	}
 
 	discoveryTopic := app.config.DiscoveryPrefix + "/device" + "/" + app.hostname + "/config"
@@ -2426,52 +2509,29 @@ func (app *Application) Run() error {
 	log.Println("=== MEDIA CONTROL CHECK COMPLETE ===")
 
 	log.Println("Starting MQTT connection...")
-	if err := app.getMQTTClient(); err != nil {
-		log.Printf("Initial MQTT connection failed: %v", err)
-		if !app.isNetworkReachable() {
-			log.Println("MQTT broker not reachable - starting in offline mode")
-			app.handleOfflineMode()
-			// Continue running, the network check ticker will handle reconnection
-		} else {
-			return fmt.Errorf("failed to connect to MQTT: %w", err)
-		}
+	if err := app.connectAtStartup(); err != nil {
+		return err
 	}
 
 	// Set up tickers for periodic updates
 	volumeTicker := time.NewTicker(UpdateInterval)
 	batteryTicker := time.NewTicker(UpdateInterval)
 	awakeTicker := time.NewTicker(UpdateInterval)
-	networkCheckTicker := time.NewTicker(30 * time.Second) // Check network every 30 seconds
+	networkCheckTicker := time.NewTicker(NetworkCheckInterval)
 	defer volumeTicker.Stop()
 	defer batteryTicker.Stop()
 	defer awakeTicker.Stop()
 	defer networkCheckTicker.Stop()
 
 	// Track connection state
-	lastConnectionState := app.isClientConnected()
-	networkReachable := true
+	conn := connectivityState{
+		lastConnected:    app.isClientConnected(),
+		networkReachable: app.client != nil,
+	}
 
 	// Initial setup - only if MQTT is connected
 	if app.isClientConnected() {
-		app.setDevice(app.client)
-		app.updateVolume(app.client)
-		app.updateMute(app.client)
-		app.updateCaffeinateStatus(app.client)
-		app.updateDisplayBrightness(app.client)
-		app.updateNowPlaying(app.client)                 // Initial now playing update
-		app.setUserActivityState(app.client, "inactive") // Initial user activity state
-		app.updateDiskUsage(app.client)                  // Initial disk usage update
-		app.updateCPUUsage(app.client)                   // Initial CPU usage update
-		app.updateMemoryUsage(app.client)                // Initial memory usage update
-		app.updateUptime(app.client)                     // Initial uptime update
-		app.updateMediaDevices(app.client)               // Initial media devices update
-		app.updatePublicIP(app.client)                   // Initial public IP update
-
-		// Start media stream for real-time updates
-		app.startMediaStream(app.client)
-
-		// Start user activity monitoring
-		app.startUserActivityMonitoring(app.client)
+		app.initialSetup(app.client)
 	} else {
 		log.Println("Skipping initial MQTT setup - will configure when connection is established")
 	}
@@ -2483,7 +2543,7 @@ func (app *Application) Run() error {
 			// Check if client is connected before publishing
 			if app.isClientConnected() {
 				app.publishPeriodicStatus(app.client)
-			} else if networkReachable {
+			} else if conn.networkReachable {
 				log.Println("MQTT client not connected but network is reachable, connection may be recovering")
 			}
 
@@ -2495,7 +2555,7 @@ func (app *Application) Run() error {
 				app.updateMemoryUsage(app.client)
 				app.updateUptime(app.client)
 				app.updatePublicIP(app.client)
-			} else if networkReachable {
+			} else if conn.networkReachable {
 				log.Println("MQTT client not connected but network is reachable, skipping battery update")
 			}
 
@@ -2503,53 +2563,177 @@ func (app *Application) Run() error {
 			if app.isClientConnected() {
 				app.updateCaffeinateStatus(app.client)
 				app.updateDisplayBrightness(app.client)
-			} else if networkReachable {
+			} else if conn.networkReachable {
 				log.Println("MQTT client not connected but network is reachable, skipping status updates")
 			}
 			// Note: Media updates now come from the media-control stream
 
 		case <-networkCheckTicker.C:
-			// Periodic network reachability check
-			currentNetworkState := app.isNetworkReachable()
-			currentConnectionState := app.isClientConnected()
-
-			// Log network state changes
-			if currentNetworkState != networkReachable {
-				if currentNetworkState {
-					log.Println("Network connectivity restored - MQTT broker is now reachable")
-				} else {
-					log.Println("Network connectivity lost - MQTT broker is no longer reachable")
-				}
-				networkReachable = currentNetworkState
-			}
-
-			// Log connection state changes
-			if currentConnectionState != lastConnectionState {
-				if currentConnectionState {
-					log.Println("MQTT connection restored")
-				} else {
-					log.Println("MQTT connection lost")
-				}
-				lastConnectionState = currentConnectionState
-			}
-
-			// Handle network state changes
-			if currentNetworkState && !networkReachable {
-				// Network just became reachable - try to reconnect if not already connected
-				if !currentConnectionState {
-					log.Println("Attempting to reconnect to MQTT broker...")
-					// The auto-reconnect should handle this, but we can force a reconnection attempt
-					go func() {
-						if app.client == nil {
-							return
-						}
-						if token := app.client.Connect(); token.Wait() && token.Error() != nil {
-							log.Printf("Reconnection attempt failed: %v", token.Error())
-						}
-					}()
-				}
-			}
+			app.runPendingInitialSetup()
+			app.networkCheck(&conn)
 		}
+	}
+}
+
+// connectAtStartup makes the startup connection. A broker that is reachable
+// but refuses the connection is fatal, as before. An unreachable one is not:
+// it gets a bounded grace period, and if it is still unreachable after that the
+// process carries on in offline mode and networkCheck recovers it later.
+func (app *Application) connectAtStartup() error {
+	err := app.getMQTTClient()
+	if err == nil {
+		return nil
+	}
+	log.Printf("Initial MQTT connection failed: %v", err)
+	if app.isNetworkReachable() {
+		return fmt.Errorf("failed to connect to MQTT: %w", err)
+	}
+
+	// A broker that is briefly unreachable at startup is common: a Local
+	// Network Privacy block on the first dial after a binary swap, or a power
+	// cut that brings this Mac up before the broker.
+	if app.waitForBroker() {
+		log.Println("MQTT broker became reachable during startup retry")
+		app.startRecoveryClient()
+		return nil
+	}
+
+	log.Println("MQTT broker not reachable - starting in offline mode")
+	app.handleOfflineMode()
+	// Continue running, networkCheck creates the client once the broker
+	// becomes reachable.
+	return nil
+}
+
+// initialSetup is the one-off publish a healthy startup makes after its first
+// connect, on top of what connectHandler already did.
+func (app *Application) initialSetup(client mqtt.Client) {
+	app.setDevice(client)
+	app.updateVolume(client)
+	app.updateMute(client)
+	app.updateCaffeinateStatus(client)
+	app.updateDisplayBrightness(client)
+	app.updateNowPlaying(client)                 // Initial now playing update
+	app.setUserActivityState(client, "inactive") // Initial user activity state
+	app.updateDiskUsage(client)                  // Initial disk usage update
+	app.updateCPUUsage(client)                   // Initial CPU usage update
+	app.updateMemoryUsage(client)                // Initial memory usage update
+	app.updateUptime(client)                     // Initial uptime update
+	app.updateMediaDevices(client)               // Initial media devices update
+	app.updatePublicIP(client)                   // Initial public IP update
+
+	// Start media stream for real-time updates
+	app.startMediaStream(client)
+
+	// Start user activity monitoring
+	app.startUserActivityMonitoring(client)
+}
+
+// connectivityState is what the network check remembers between ticks, so
+// that it logs transitions rather than every probe.
+type connectivityState struct {
+	networkReachable bool
+	lastConnected    bool
+}
+
+// waitForBroker re-probes an unreachable broker with exponential backoff for
+// at most the startup retry budget, and reports whether it became reachable.
+// It never sleeps past the budget; the only overrun is the final probe's own
+// dial timeout.
+func (app *Application) waitForBroker() bool {
+	budget := app.startupRetryBudget
+	if budget <= 0 {
+		budget = StartupRetryBudget
+	}
+	backoff := app.startupRetryBackoff
+	if backoff <= 0 {
+		backoff = StartupRetryInitialBackoff
+	}
+	deadline := time.Now().Add(budget)
+
+	for attempt := 1; ; attempt++ {
+		if time.Now().Add(backoff).After(deadline) {
+			log.Printf("MQTT broker still not reachable after %d startup retries", attempt-1)
+			return false
+		}
+		time.Sleep(backoff)
+		log.Printf("Startup retry %d: probing MQTT broker", attempt)
+		if app.isNetworkReachable() {
+			return true
+		}
+		if backoff *= 2; backoff > StartupRetryMaxBackoff {
+			backoff = StartupRetryMaxBackoff
+		}
+	}
+}
+
+// startRecoveryClient creates the one MQTT client for a process that did not
+// get one at startup, and starts it connecting.
+//
+// It does not wait on the connect token. With ConnectRetry set (see
+// mqttClientOptions) Paho's Connect returns at once and keeps retrying in its
+// own goroutine until the broker accepts, so waiting here would be unbounded.
+// On success Paho runs OnConnect, which is connectHandler: exactly the path a
+// healthy startup and every reconnect take, with the will already in the
+// CONNECT packet because it is part of the options the client was built from.
+// After that first connection AutoReconnect owns every later drop, so this is
+// only ever needed once per process.
+func (app *Application) startRecoveryClient() {
+	log.Println("Creating MQTT client - connection will be configured by the connect handler")
+	client := app.newMQTTClient()
+	app.client = client
+	app.initialSetupPending = true
+	client.Connect()
+}
+
+// runPendingInitialSetup finishes a recovery once its client has connected, by
+// making the one-off publishes that a healthy startup makes after connecting.
+func (app *Application) runPendingInitialSetup() {
+	if !app.initialSetupPending || !app.isClientConnected() {
+		return
+	}
+	app.initialSetupPending = false
+	log.Println("Running initial MQTT setup for recovered connection")
+	app.initialSetup(app.client)
+}
+
+// networkCheck is the body of the periodic network check. Besides logging
+// reachability and connection transitions, it is what gets a process out of
+// offline mode: if the broker is reachable and no client was ever created, it
+// creates one. Nothing else does, because Paho's reconnect logic only exists
+// once a client does.
+//
+// It must only be called from the goroutine that owns app.client (Run's loop).
+// That single owner is what guarantees at most one client: once app.client is
+// set it is never replaced, so repeated or racing checks cannot build a second
+// client, a second set of connect handlers, or a second subscription.
+func (app *Application) networkCheck(st *connectivityState) {
+	currentNetworkState := app.isNetworkReachable()
+	currentConnectionState := app.isClientConnected()
+
+	// Log network state changes
+	if currentNetworkState != st.networkReachable {
+		if currentNetworkState {
+			log.Println("Network connectivity restored - MQTT broker is now reachable")
+		} else {
+			log.Println("Network connectivity lost - MQTT broker is no longer reachable")
+		}
+		st.networkReachable = currentNetworkState
+	}
+
+	// Log connection state changes
+	if currentConnectionState != st.lastConnected {
+		if currentConnectionState {
+			log.Println("MQTT connection restored")
+		} else {
+			log.Println("MQTT connection lost")
+		}
+		st.lastConnected = currentConnectionState
+	}
+
+	if currentNetworkState && app.client == nil {
+		log.Println("MQTT broker reachable with no MQTT client - leaving offline mode")
+		app.startRecoveryClient()
 	}
 }
 
