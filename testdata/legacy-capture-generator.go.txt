@@ -1,0 +1,201 @@
+package main
+
+// Generates the legacy on-wire fixture by running the UNMODIFIED code from
+// b5a986a under a recording MQTT client.
+//
+//	go test -run TestGenerateLegacyFixture -v
+//
+// Writes legacy-fixture.json. The media-control variant is selected by the
+// MAC2MQTT_FIXTURE_VARIANT env var ("with-media-control" or "no-media-control");
+// main probes for it with exec.LookPath, so the caller controls that by running
+// this with media-control hidden from PATH. Nothing in main is modified.
+
+import (
+	"encoding/json"
+	"os"
+	"sort"
+	"testing"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+type capOp struct {
+	Kind     string `json:"kind"`
+	Topic    string `json:"topic"`
+	QoS      byte   `json:"qos"`
+	Retained bool   `json:"retained"`
+	Payload  string `json:"payload,omitempty"`
+}
+
+type capToken struct{}
+
+func (capToken) Wait() bool                     { return true }
+func (capToken) WaitTimeout(time.Duration) bool { return true }
+func (capToken) Done() <-chan struct{}          { ch := make(chan struct{}); close(ch); return ch }
+func (capToken) Error() error                   { return nil }
+
+type capClient struct{ ops []capOp }
+
+func (c *capClient) IsConnected() bool      { return true }
+func (c *capClient) IsConnectionOpen() bool { return true }
+func (c *capClient) Connect() mqtt.Token    { return capToken{} }
+func (c *capClient) Disconnect(uint)        {}
+func (c *capClient) Publish(topic string, qos byte, retained bool, payload interface{}) mqtt.Token {
+	var b []byte
+	switch v := payload.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	}
+	c.ops = append(c.ops, capOp{"publish", topic, qos, retained, string(b)})
+	return capToken{}
+}
+func (c *capClient) Subscribe(topic string, qos byte, _ mqtt.MessageHandler) mqtt.Token {
+	c.ops = append(c.ops, capOp{Kind: "subscribe", Topic: topic, QoS: qos})
+	return capToken{}
+}
+func (c *capClient) SubscribeMultiple(map[string]byte, mqtt.MessageHandler) mqtt.Token {
+	return capToken{}
+}
+func (c *capClient) Unsubscribe(...string) mqtt.Token        { return capToken{} }
+func (c *capClient) AddRoute(string, mqtt.MessageHandler)    {}
+func (c *capClient) OptionsReader() mqtt.ClientOptionsReader { return mqtt.ClientOptionsReader{} }
+
+const discoveryDest = "homeassistant/device/test-host/config"
+
+// normaliseDiscovery replaces the only fields that legitimately vary per host
+// with fixed placeholders, so the rest of the payload can be compared exactly.
+// Everything else (component keys, state_topic, value_template, units,
+// device_class, payload mappings, discovery-level qos, availability wiring) is
+// preserved verbatim.
+func normaliseDiscovery(t *testing.T, raw string) string {
+	t.Helper()
+	var doc map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("discovery payload is not JSON: %v", err)
+	}
+	if dev, ok := doc["dev"].(map[string]interface{}); ok {
+		if _, present := dev["ids"]; present {
+			dev["ids"] = "<SERIAL>" // getSerialnumber()
+		}
+		if _, present := dev["mdl"]; present {
+			dev["mdl"] = "<MODEL>" // getModel()
+		}
+	}
+	// Marshal through the map so key order is canonical (encoding/json sorts
+	// map keys), making the result stable and diffable.
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+type fixture struct {
+	Source                string  `json:"source_commit"`
+	Variant               string  `json:"variant"`
+	MediaControlAvailable bool    `json:"media_control_available"`
+	ConnectOps            []capOp `json:"connect_ops"`
+	DiscoveryPayload      string  `json:"discovery_payload"`
+	PeriodicOps           []capOp `json:"periodic_ops"`
+	Will                  capOp   `json:"will"`
+}
+
+func TestGenerateLegacyFixture(t *testing.T) {
+	variant := os.Getenv("MAC2MQTT_FIXTURE_VARIANT")
+	if variant == "" {
+		t.Fatal("set MAC2MQTT_FIXTURE_VARIANT")
+	}
+	available := isMediaControlAvailable()
+	switch variant {
+	case "with-media-control":
+		if !available {
+			t.Fatal("variant expects media-control on PATH, but it is absent")
+		}
+	case "no-media-control":
+		if available {
+			t.Fatal("variant expects media-control hidden from PATH, but it was found")
+		}
+	default:
+		t.Fatalf("unknown variant %q", variant)
+	}
+
+	app := &Application{
+		config: &config{
+			IP: "192.168.10.1", Port: "1883",
+			Hostname: "test-host", Topic: "mac2mqtt",
+			DiscoveryPrefix: "homeassistant",
+		},
+		hostname: "test-host",
+		topic:    "mac2mqtt/test-host",
+	}
+	// Neutralise the background workers with their own production CAS guards.
+	app.activityMonitorStarted.Store(true)
+	app.mediaStreamStarted.Store(true)
+
+	c := &capClient{}
+	app.connectHandler(c)
+
+	var discovery string
+	for _, o := range c.ops {
+		if o.Topic == discoveryDest {
+			discovery = normaliseDiscovery(t, o.Payload)
+		}
+	}
+	if discovery == "" {
+		t.Fatal("no discovery payload captured")
+	}
+
+	// The periodic tick body, as main wrote it inline in the select loop.
+	pc := &capClient{}
+	app.updateVolume(pc)
+	app.updateMute(pc)
+	app.updateMediaDevices(pc)
+	pc.Publish(app.getTopicPrefix()+"/status/alive", 0, true, "online")
+
+	// Keep payloads only where they are config-derived and stable. Live system
+	// readings (volume, mute, caffeinate, now playing) are excluded; the
+	// discovery payload is captured separately and in full, above.
+	stable := func(ops []capOp) []capOp {
+		out := make([]capOp, 0, len(ops))
+		for _, o := range ops {
+			if o.Topic != "mac2mqtt/test-host/status/alive" {
+				o.Payload = ""
+			}
+			out = append(out, o)
+		}
+		return out
+	}
+
+	f := fixture{
+		Source:                "b5a986ad2b5cc76a6010ce455baa254b554a905d",
+		Variant:               variant,
+		MediaControlAvailable: available,
+		ConnectOps:            stable(c.ops),
+		DiscoveryPayload:      discovery,
+		PeriodicOps:           stable(pc.ops),
+		Will:                  capOp{"will", app.getTopicPrefix() + "/status/alive", 0, true, "offline"},
+	}
+
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "legacy-onwire-b5a986a-" + variant + ".json"
+	if err := os.WriteFile(name, append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	var doc struct {
+		Cmps map[string]json.RawMessage `json:"cmps"`
+	}
+	json.Unmarshal([]byte(discovery), &doc)
+	for k := range doc.Cmps {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	t.Logf("wrote %s: %d connect ops, %d periodic ops, %d components, payload %d bytes",
+		name, len(f.ConnectOps), len(f.PeriodicOps), len(keys), len(discovery))
+}

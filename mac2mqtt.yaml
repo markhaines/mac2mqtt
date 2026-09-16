@@ -6,3 +6,8 @@ mqtt_ssl: false
 hostname: macbook-air-2
 mqtt_topic: iot/MyMac
 idle_activity_time: 30
+
+# Optional. Omit both (or leave them false) to keep the default behaviour.
+# Intended for headless / server installs, see README.
+#disable_media_devices: true       # no camera or microphone sensors
+#disable_display_brightness: true  # no BetterDisplay brightness controls

@@ -136,6 +136,36 @@ type Application struct {
 	// activity-monitor goroutine and another media-control subprocess.
 	activityMonitorStarted atomic.Bool
 	mediaStreamStarted     atomic.Bool
+
+	// Media-control seams. These exist so tests can pin what would otherwise
+	// be ambient environment: whether the media-control binary is installed,
+	// and what it reports. That is what lets the compatibility comparison run
+	// on a machine with media-control and on one without, rather than being
+	// skipped on either.
+	//
+	// They are per-Application and are set at construction, before any of the
+	// goroutines that read them exist, and never reassigned afterwards. That
+	// ordering is what makes them safe without synchronisation: goroutine
+	// creation establishes the happens-before edge. A nil field means "use the
+	// real implementation", so a zero-value Application behaves normally.
+	mediaControlFn func() bool
+	mediaInfoFn    func() (*MediaInfo, error)
+}
+
+// mediaControlAvailable reports whether the media-control binary is installed.
+func (app *Application) mediaControlAvailable() bool {
+	if app.mediaControlFn != nil {
+		return app.mediaControlFn()
+	}
+	return isMediaControlAvailable()
+}
+
+// mediaInfoSource reads the current media state.
+func (app *Application) mediaInfoSource() (*MediaInfo, error) {
+	if app.mediaInfoFn != nil {
+		return app.mediaInfoFn()
+	}
+	return getMediaInfo()
 }
 
 type config struct {
@@ -148,6 +178,26 @@ type config struct {
 	Topic            string `yaml:"mqtt_topic"`
 	DiscoveryPrefix  string `yaml:"discovery_prefix"`
 	IdleActivityTime int    `yaml:"idle_activity_time"` // in seconds
+
+	// Optional sensor switches. These are opt-OUT on purpose: the zero value
+	// of a bool is false, so a config that omits them keeps every sensor
+	// enabled and an existing install upgrading the binary sees no change.
+	DisableMediaDevices      bool `yaml:"disable_media_devices"`      // camera + microphone binary sensors
+	DisableDisplayBrightness bool `yaml:"disable_display_brightness"` // BetterDisplay brightness controls
+}
+
+// mediaDevicesEnabled reports whether the camera/microphone sensors should be
+// polled and published. Headless machines with no camera fail this poll every
+// cycle, so it can be switched off with disable_media_devices.
+func (app *Application) mediaDevicesEnabled() bool {
+	return app.config == nil || !app.config.DisableMediaDevices
+}
+
+// displayBrightnessEnabled reports whether the BetterDisplay brightness
+// controls should be discovered, polled and published. Servers with no display
+// worth controlling can switch this off with disable_display_brightness.
+func (app *Application) displayBrightnessEnabled() bool {
+	return app.config == nil || !app.config.DisableDisplayBrightness
 }
 
 func (c *config) getConfig() *config {
@@ -219,12 +269,16 @@ func NewApplication() (*Application, error) {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
 	}
 
-	// Initialize displays
-	app.displays = getDisplays()
+	// Initialize displays. When brightness is disabled we never shell out to
+	// betterdisplaycli at all, so app.displays stays nil and every downstream
+	// display code path (discovery, polling, commands) is a no-op.
+	if app.displayBrightnessEnabled() {
+		app.displays = getDisplays()
+	}
 
 	// Initialize currentMediaState
-	if isMediaControlAvailable() {
-		mediaInfo, err := getMediaInfo()
+	if app.mediaControlAvailable() {
+		mediaInfo, err := app.mediaInfoSource()
 		if err == nil && mediaInfo != nil {
 			app.currentMediaState = *mediaInfo
 		} else {
@@ -710,7 +764,7 @@ func getMediaInfo() (*MediaInfo, error) {
 
 // updateMediaPlayer updates the MQTT topics with current media player information
 func (app *Application) updateMediaPlayer(client mqtt.Client) {
-	mediaInfo, err := getMediaInfo()
+	mediaInfo, err := app.mediaInfoSource()
 	if err != nil {
 		// Check if it's a Media Control error
 		if _, ok := err.(*MediaControlError); ok {
@@ -749,7 +803,7 @@ func (app *Application) updateMediaPlayer(client mqtt.Client) {
 
 // updateNowPlaying updates the now playing sensor with current media information
 func (app *Application) updateNowPlaying(client mqtt.Client) {
-	mediaInfo, err := getMediaInfo()
+	mediaInfo, err := app.mediaInfoSource()
 	if err != nil {
 		if _, ok := err.(*MediaControlError); ok {
 			log.Printf("Media Control is not available: %v", err)
@@ -808,7 +862,7 @@ func (app *Application) updateNowPlaying(client mqtt.Client) {
 
 // startMediaStream starts the media-control stream for real-time updates
 func (app *Application) startMediaStream(client mqtt.Client) {
-	if !isMediaControlAvailable() {
+	if !app.mediaControlAvailable() {
 		log.Println("Media Control not available - skipping media stream")
 		return
 	}
@@ -1118,6 +1172,10 @@ func (app *Application) publishMediaState(client mqtt.Client, state, title, arti
 
 // updateDisplayBrightness updates the MQTT topics with current display brightness values
 func (app *Application) updateDisplayBrightness(client mqtt.Client) {
+	if !app.displayBrightnessEnabled() {
+		return
+	}
+
 	// Skip if no displays are available
 	if len(app.displays) == 0 {
 		return
@@ -1158,17 +1216,22 @@ func (app *Application) messagePubHandler(client mqtt.Client, msg mqtt.Message) 
 func (app *Application) connectHandler(client mqtt.Client) {
 	log.Println("Connected to MQTT")
 
-	// Set up device configuration (in case this is a reconnection)
-	app.setDevice(client)
-
-	token := client.Publish(app.getTopicPrefix()+"/status/alive", 0, true, "online")
-	token.Wait()
-
-	log.Println("Sending 'online' to topic: " + app.getTopicPrefix() + "/status/alive")
+	// ORDERING IS LOAD BEARING. The retained availability message and the
+	// command subscription come first and are never gated on discovery.
+	// This topic is the only liveness signal some hosts give Home Assistant,
+	// and command/# carries the manual shutdown, so neither may wait behind a
+	// discovery publish that can block for the full 10s write timeout or fail
+	// outright against a slow or unhappy broker. setDevice is best effort and
+	// runs afterwards; whatever it does cannot delay or abort these two.
+	app.publishAlive(client)
 	app.sub(client, app.getTopicPrefix()+"/command/#")
 
+	// Set up device configuration (in case this is a reconnection). Best
+	// effort only: a failure here must never affect availability or commands.
+	app.setDevice(client)
+
 	// Start media stream if not already running (for reconnections)
-	if isMediaControlAvailable() {
+	if app.mediaControlAvailable() {
 		go app.startMediaStream(client)
 	}
 
@@ -1213,18 +1276,10 @@ func (app *Application) isNetworkReachable() bool {
 	return true
 }
 
-func (app *Application) getMQTTClientWithRetry(retryCount int) error {
-	// Prevent infinite recursion
-	if retryCount > MaxRetryAttempts {
-		return fmt.Errorf("failed to connect to MQTT broker after multiple attempts")
-	}
-
-	// Check network reachability first to avoid long timeouts
-	if !app.isNetworkReachable() {
-		log.Printf("MQTT broker is not reachable on current network, will retry later")
-		return fmt.Errorf("MQTT broker not reachable")
-	}
-
+// mqttClientOptions builds the broker options, including the last will that is
+// this host's death signal. Split out from the connect path so the will can be
+// asserted in tests without standing up a broker.
+func (app *Application) mqttClientOptions() *mqtt.ClientOptions {
 	opts := mqtt.NewClientOptions()
 
 	// Determine protocol and broker URL
@@ -1266,10 +1321,37 @@ func (app *Application) getMQTTClientWithRetry(retryCount int) error {
 	opts.SetWriteTimeout(10 * time.Second)         // Shorter write timeout for network issues
 	opts.SetResumeSubs(true)                       // Resume subscriptions on reconnect
 
-	// Set will message
+	// Set will message. This is the death signal: if this process dies without
+	// a clean disconnect, the broker publishes it retained on our behalf.
 	opts.SetWill(app.getTopicPrefix()+"/status/alive", "offline", 0, true)
 
-	client := mqtt.NewClient(opts)
+	return opts
+}
+
+// newMQTTClient builds the client from fully populated options. Paho copies
+// the options struct in NewClient, so construction must happen last; keeping
+// both steps in one place is what stops them drifting apart.
+func (app *Application) newMQTTClient() mqtt.Client {
+	return mqtt.NewClient(app.mqttClientOptions())
+}
+
+func (app *Application) getMQTTClientWithRetry(retryCount int) error {
+	// Prevent infinite recursion
+	if retryCount > MaxRetryAttempts {
+		return fmt.Errorf("failed to connect to MQTT broker after multiple attempts")
+	}
+
+	// Check network reachability first to avoid long timeouts
+	if !app.isNetworkReachable() {
+		log.Printf("MQTT broker is not reachable on current network, will retry later")
+		return fmt.Errorf("MQTT broker not reachable")
+	}
+
+	// Options are fully built before the client is constructed: Paho copies
+	// the options by value in NewClient, so anything set afterwards is
+	// silently ignored.
+	client := app.newMQTTClient()
+
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
 		// If SSL connection fails, try falling back to non-SSL
 		if app.config.SSL {
@@ -1282,6 +1364,42 @@ func (app *Application) getMQTTClientWithRetry(retryCount int) error {
 
 	app.client = client
 	return nil
+}
+
+// publishPeriodicStatus is the 60s tick body. The availability heartbeat at the
+// end of it is published in every configuration: disabling a sensor must never
+// stop this host telling Home Assistant it is alive.
+func (app *Application) publishPeriodicStatus(client mqtt.Client) {
+	app.updateVolume(client)
+	app.updateMute(client)
+	app.updateMediaDevices(client)
+	app.publishAliveAsync(client)
+}
+
+// aliveTopic is the availability topic. Both publishers go through it so the
+// two can never drift apart.
+func (app *Application) aliveTopic() string {
+	return app.getTopicPrefix() + "/status/alive"
+}
+
+// publishAliveAsync is the 60s heartbeat publish: fire and forget, no token
+// wait and no success log, matching the behaviour before this feature existed.
+// A synchronous wait here would put the timer loop at the mercy of the broker,
+// and a success line every 60 seconds is exactly the log noise this change
+// exists to remove.
+func (app *Application) publishAliveAsync(client mqtt.Client) {
+	client.Publish(app.aliveTopic(), 0, true, "online")
+}
+
+// publishAlive is the connect-time availability publish: retained, waited on
+// and logged once, as it was before. It is deliberately free of any dependency
+// on sensor configuration or discovery state, so every configuration publishes
+// the same retained payload to the same topic.
+func (app *Application) publishAlive(client mqtt.Client) {
+	topic := app.aliveTopic()
+	token := client.Publish(topic, 0, true, "online")
+	token.Wait()
+	log.Println("Sending 'online' to topic: " + topic)
 }
 
 func (app *Application) sub(client mqtt.Client, topic string) {
@@ -1366,6 +1484,18 @@ func (app *Application) handleMuteCommand(client mqtt.Client, topic, payload str
 	return true
 }
 
+// The system command actions are reached through function variables so that
+// the dispatch from a command/set payload can be verified in tests without
+// actually sleeping or powering off the machine. Production behaviour is
+// unchanged: these point at the real implementations.
+var (
+	systemSleep        = commandSleep
+	systemDisplaySleep = commandDisplaySleep
+	systemDisplayWake  = commandDisplayWake
+	systemShutdown     = commandShutdown
+	systemScreensaver  = commandScreensaver
+)
+
 // handleSystemCommand handles system control commands
 func (app *Application) handleSystemCommand(topic, payload string) bool {
 	if topic != app.getTopicPrefix()+"/command/set" {
@@ -1374,15 +1504,15 @@ func (app *Application) handleSystemCommand(topic, payload string) bool {
 
 	switch payload {
 	case "sleep":
-		commandSleep()
+		systemSleep()
 	case "displaysleep":
-		commandDisplaySleep()
+		systemDisplaySleep()
 	case "displaywake":
-		commandDisplayWake()
+		systemDisplayWake()
 	case "shutdown":
-		commandShutdown()
+		systemShutdown()
 	case "screensaver":
-		commandScreensaver()
+		systemScreensaver()
 	default:
 		log.Printf("Unknown system command: %s", payload)
 	}
@@ -1391,6 +1521,13 @@ func (app *Application) handleSystemCommand(topic, payload string) bool {
 
 // handleDisplayBrightnessCommand handles display brightness commands
 func (app *Application) handleDisplayBrightnessCommand(client mqtt.Client, topic, payload string) bool {
+	// Brightness disabled: no brightness entity was ever discovered, so this
+	// can only be a stale retained command. Ignore it silently and let the
+	// remaining handlers see the topic.
+	if !app.displayBrightnessEnabled() {
+		return false
+	}
+
 	// Check if we have any displays available
 	if len(app.displays) == 0 {
 		log.Printf("Received display brightness command but no displays are available")
@@ -1740,6 +1877,10 @@ func getMediaDevicesState() (bool, bool, error) {
 }
 
 func (app *Application) updateMediaDevices(client mqtt.Client) {
+	if !app.mediaDevicesEnabled() {
+		return
+	}
+
 	isMicOn, isCameraOn, err := getMediaDevicesState()
 	if err != nil {
 		log.Printf("Failed to get media devices state: %v", err)
@@ -2096,9 +2237,20 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"memory_free_percent": memoryFreePercent,
 		"uptime_seconds":      uptimeSeconds,
 		"uptime_human":        uptimeHuman,
-		"microphone":          microphone,
-		"camera":              camera,
 		"public_ip":           publicIP,
+	}
+
+	// A disabled sensor is simply left out of the discovery payload, so it is
+	// never created. Retiring an entity that a previous version already
+	// created is NOT attempted here: the discovery topic is retained, so a
+	// Home Assistant that is offline while we publish only ever sees the last
+	// payload. A removal stub followed by a clean payload would therefore be
+	// honoured only if HA happened to be listening in between, which is the
+	// appearance of cleanup rather than the guarantee of it. Orphan removal is
+	// a documented one-time manual step instead; see the README.
+	if app.mediaDevicesEnabled() {
+		components["microphone"] = microphone
+		components["camera"] = camera
 	}
 
 	// Add user activity sensor
@@ -2128,7 +2280,7 @@ func (app *Application) setDevice(client mqtt.Client) {
 	components["idle_time_seconds"] = idleTime
 
 	// Add media control components if Media Control is available
-	if isMediaControlAvailable() {
+	if app.mediaControlAvailable() {
 		playPause := map[string]interface{}{
 			"p":             "button",
 			"name":          "Play/Pause",
@@ -2153,8 +2305,14 @@ func (app *Application) setDevice(client mqtt.Client) {
 
 	// Note: Media player will be published as separate standard MQTT autodiscovery message
 
-	// Add display brightness controls for each display
-	for _, display := range app.displays {
+	// Add display brightness controls for each display. app.displays is empty
+	// when disable_display_brightness is set; the explicit guard means a stale
+	// display list can never reintroduce the entity either.
+	displays := app.displays
+	if !app.displayBrightnessEnabled() {
+		displays = nil
+	}
+	for _, display := range displays {
 		displayBrightness := map[string]interface{}{
 			"p":             "number",
 			"name":          display.Name + " Brightness",
@@ -2181,6 +2339,8 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"mdl":  getModel(),
 	}
 
+	discoveryTopic := app.config.DiscoveryPrefix + "/device" + "/" + app.hostname + "/config"
+
 	object := map[string]interface{}{
 		"dev":                device,
 		"o":                  origin,
@@ -2188,10 +2348,30 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"availability_topic": app.getTopicPrefix() + "/status/alive",
 		"qos":                2,
 	}
-	objectJSON, _ := json.Marshal(object)
+	objectJSON, err := json.Marshal(object)
+	if err != nil {
+		log.Printf("Failed to encode discovery config: %v", err)
+		return
+	}
 
-	token := client.Publish(app.config.DiscoveryPrefix+"/device"+"/"+app.hostname+"/config", 0, true, objectJSON)
+	// QoS 0 and retained, exactly as before this feature existed. QoS must not
+	// be raised here: a user who drops in this binary without editing their
+	// config would get different on-wire behaviour, which the compatibility
+	// contract forbids.
+	//
+	// It also matters for startup. Run calls setDevice before entering the
+	// timer loop, and Paho completes a QoS 0 token once the socket write
+	// completes (bounded by SetWriteTimeout) rather than on PUBACK. At QoS 1
+	// this wait would instead depend on the broker acknowledging, so one that
+	// accepted writes but never replied would leave the process connected and
+	// subscribed yet never beating. This says nothing about the other waits on
+	// the connect path, such as connect retry or SUBACK, which are unchanged
+	// from before this feature.
+	token := client.Publish(discoveryTopic, 0, true, objectJSON)
 	token.Wait()
+	if err := token.Error(); err != nil {
+		log.Printf("Failed to publish discovery config to %s: %v", discoveryTopic, err)
+	}
 
 	// Note: Media player functionality replaced with play/pause button and now playing sensor
 }
@@ -2216,7 +2396,9 @@ func (app *Application) Run() error {
 
 	// Initialize displays before MQTT connection
 	log.Println("=== DISCOVERING DISPLAYS ===")
-	if len(app.displays) > 0 {
+	if !app.displayBrightnessEnabled() {
+		log.Println("Display brightness disabled by config (disable_display_brightness)")
+	} else if len(app.displays) > 0 {
 		log.Printf("Found %d display(s):", len(app.displays))
 		for _, display := range app.displays {
 			log.Printf("  - %s (ID: %s)", display.Name, display.DisplayID)
@@ -2226,9 +2408,13 @@ func (app *Application) Run() error {
 	}
 	log.Println("=== DISPLAY DISCOVERY COMPLETE ===")
 
+	if !app.mediaDevicesEnabled() {
+		log.Println("Camera/microphone sensors disabled by config (disable_media_devices)")
+	}
+
 	// Check Media Control availability
 	log.Println("=== CHECKING MEDIA CONTROL ===")
-	if isMediaControlAvailable() {
+	if app.mediaControlAvailable() {
 		log.Println("Media Control is available - Media player will be enabled")
 	} else {
 		log.Println("Media Control is not installed or not accessible")
@@ -2296,10 +2482,7 @@ func (app *Application) Run() error {
 		case <-volumeTicker.C:
 			// Check if client is connected before publishing
 			if app.isClientConnected() {
-				app.updateVolume(app.client)
-				app.updateMute(app.client)
-				app.updateMediaDevices(app.client)
-				app.client.Publish(app.getTopicPrefix()+"/status/alive", 0, true, "online")
+				app.publishPeriodicStatus(app.client)
 			} else if networkReachable {
 				log.Println("MQTT client not connected but network is reachable, connection may be recovering")
 			}

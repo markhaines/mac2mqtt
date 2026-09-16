@@ -75,6 +75,103 @@ Edit `mac2mqtt.yaml` (the sample file is in this repository), make binary execut
     2021/04/12 10:37:29 Connected to MQTT
     2021/04/12 10:37:29 Sending 'true' to topic: mac2mqtt/bessarabov-osx/status/alive
 
+### Configuration
+
+All settings live in `mac2mqtt.yaml`. Only `mqtt_ip` and `mqtt_port` are required.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `mqtt_ip` | required | Broker address |
+| `mqtt_port` | required | Broker port |
+| `mqtt_user` | empty | Broker username |
+| `mqtt_password` | empty | Broker password |
+| `mqtt_ssl` | `false` | Connect over TLS |
+| `hostname` | system hostname | Name used in topics and in Home Assistant |
+| `mqtt_topic` | `mac2mqtt` | Topic prefix, the hostname is appended to it |
+| `discovery_prefix` | `homeassistant` | Home Assistant discovery prefix |
+| `idle_activity_time` | `10` | Seconds of inactivity before user activity flips to inactive |
+| `disable_media_devices` | `false` | Switch off the camera and microphone sensors |
+| `disable_display_brightness` | `false` | Switch off the display brightness controls |
+
+#### Disabling sensors on headless and server installs
+
+`disable_media_devices` and `disable_display_brightness` exist for Macs that run
+as always-on servers: a machine in a rack with no camera, or one whose display is
+not worth controlling from Home Assistant. On those machines the two sensors poll
+hardware that is not really there, fail every cycle, and write a steady stream of
+errors into the log for no benefit.
+
+    # Headless server: no camera, and the display is not controlled from HA
+    disable_media_devices: true
+    disable_display_brightness: true
+
+`disable_media_devices: true` stops the camera and microphone from being polled
+and stops both binary sensors being offered to Home Assistant.
+
+`disable_display_brightness: true` stops BetterDisplay CLI from being called at
+all. No display is enumerated at startup, no brightness is polled, and no
+brightness control is offered to Home Assistant.
+
+Both keys are optional and both default to `false`. **Omitting them keeps the
+current behaviour exactly**, so an existing installation can upgrade the binary
+without touching its config file and nothing changes.
+
+Everything else is unaffected in every configuration. In particular the
+availability topic `PREFIX/status/alive` and the command topic
+`PREFIX/command/set` (which carries `shutdown`) are identical in content and in
+timing whether these sensors are on or off. On connect, the retained `online`
+message is published and `PREFIX/command/#` is subscribed *before* any discovery
+work, so a slow or failing discovery publish can never delay or suppress the
+availability signal or the shutdown path.
+
+#### Removing entities that already exist
+
+A disabled sensor is left out of the discovery payload, so it is never created
+on a fresh install. It is **not** deleted automatically if a previous version of
+mac2mqtt already created it.
+
+This is a deliberate choice rather than an oversight. The discovery topic is
+retained, which means Home Assistant only ever sees the most recent payload.
+Publishing a removal instruction and then a clean payload would be honoured only
+if Home Assistant happened to be connected in the gap between the two, so it
+would work most of the time and silently fail the rest, which is worse than
+being told to do it yourself.
+
+So if you switch a sensor off on an installation that was already running it,
+remove the leftover entities once by hand. The order matters: dropping a
+component from the discovery payload does not unload an entity that Home
+Assistant has already set up, and until Home Assistant reloads it the entity
+keeps its last state and the device's availability. Its **Delete** button stays
+greyed out in that state, so deleting has to come last.
+
+1. Add the key to `mac2mqtt.yaml` and restart mac2mqtt.
+2. Confirm the new **retained** discovery payload no longer lists the sensor:
+
+   ```sh
+   mosquitto_sub -h <broker> -t '<discovery_prefix>/device/<hostname>/config' \
+       --retained-only -W 5
+   ```
+
+   `--retained-only` is what makes this meaningful: it ignores live traffic, so
+   anything printed really is the retained payload a newly-started Home
+   Assistant would receive. `-W 5` exits after five seconds, so nothing printed
+   means nothing is retained on that topic.
+
+   Substitute `<discovery_prefix>` with your `discovery_prefix` setting
+   (`homeassistant` unless you changed it) and `<hostname>` with your
+   `hostname`. Add `-p <port>` for a non-default port, `-u <user> -P <pass>` if
+   the broker needs credentials, and for TLS `-p 8883 --cafile <ca.crt>`.
+3. Reload the MQTT integration (**Settings > Devices & Services > MQTT >
+   ... > Reload**), or restart Home Assistant. This is the step that unloads
+   the entity; skip it and the Delete button stays disabled.
+4. Now delete the leftover entities: **Settings > Devices & Services > MQTT**,
+   pick the device, open each stale entity and delete it.
+
+This is a one-time step and they will not come back. It applies to both keys:
+`disable_media_devices` leaves a `Camera` and a `Microphone` binary sensor
+behind, and `disable_display_brightness` leaves one `<display> Brightness`
+number entity per display that was previously detected.
+
 ### Running in the background
 
 You need `mac2mqtt.yaml` and `mac2mqtt` to be placed in the directory `/Users/USERNAME/mac2mqtt/`,
