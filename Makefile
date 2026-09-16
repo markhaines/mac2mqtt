@@ -17,6 +17,44 @@ GOMOD=$(GOCMD) mod
 # Build flags
 CGO_ENABLED=1
 
+# Local code signing (see README "Local build and signing").
+# macOS Local Network Privacy keys its approval to code identity. The Go linker
+# ad-hoc signs as "a.out", so every rebuild looks like a new app and the approval
+# is lost. Signing with a stable self-signed identity keeps it. If the keychain
+# or identity is absent (CI, other machines) the build warns and carries on.
+# Set CODESIGN_IDENTITY= (empty) to skip signing.
+CODESIGN_IDENTITY ?= mac2mqtt Local Dev
+CODESIGN_IDENTIFIER ?= com.markhaines.mac2mqtt
+CODESIGN_KEYCHAIN ?= $(HOME)/Library/Keychains/mac2mqtt-signing.keychain-db
+CODESIGN_KEYCHAIN_SERVICE ?= mac2mqtt-signing-keychain
+CODESIGN_KEYCHAIN_ACCOUNT ?= $(USER)
+
+# Sign $(1) with the stable identity, then verify the result rather than
+# trusting the flags: fail if Authority or Identifier did not take.
+define codesign_local
+	@if [ -z "$(CODESIGN_IDENTITY)" ]; then \
+		echo "WARNING: CODESIGN_IDENTITY is empty, $(1) left ad-hoc signed"; \
+	elif [ ! -f "$(CODESIGN_KEYCHAIN)" ]; then \
+		echo "WARNING: signing keychain $(CODESIGN_KEYCHAIN) not found, $(1) left ad-hoc signed (Local Network approval will not survive rebuilds)"; \
+	elif ! kcpw=$$(security find-generic-password -s "$(CODESIGN_KEYCHAIN_SERVICE)" -a "$(CODESIGN_KEYCHAIN_ACCOUNT)" -w 2>/dev/null); then \
+		echo "WARNING: no login keychain item $(CODESIGN_KEYCHAIN_SERVICE), $(1) left ad-hoc signed"; \
+	elif ! security unlock-keychain -p "$$kcpw" "$(CODESIGN_KEYCHAIN)"; then \
+		echo "ERROR: could not unlock $(CODESIGN_KEYCHAIN)"; exit 1; \
+	elif ! security find-identity -p codesigning "$(CODESIGN_KEYCHAIN)" | grep -qF '"$(CODESIGN_IDENTITY)"'; then \
+		echo "WARNING: identity '$(CODESIGN_IDENTITY)' not in $(CODESIGN_KEYCHAIN), $(1) left ad-hoc signed"; \
+	else \
+		echo "Signing $(1) as '$(CODESIGN_IDENTITY)' ($(CODESIGN_IDENTIFIER))..."; \
+		codesign --force --keychain "$(CODESIGN_KEYCHAIN)" -s "$(CODESIGN_IDENTITY)" --identifier "$(CODESIGN_IDENTIFIER)" "$(1)" || exit 1; \
+		info=$$(codesign -dvvv "$(1)" 2>&1); \
+		if ! printf '%s\n' "$$info" | grep -qxF "Authority=$(CODESIGN_IDENTITY)" || \
+		   ! printf '%s\n' "$$info" | grep -qxF "Identifier=$(CODESIGN_IDENTIFIER)"; then \
+			echo "ERROR: $(1) signature did not take. codesign -dvvv reports:"; \
+			printf '%s\n' "$$info"; exit 1; \
+		fi; \
+		printf '%s\n' "$$info" | grep -E '^(Identifier|Authority|TeamIdentifier)='; \
+	fi
+endef
+
 .PHONY: all build clean test deps help build-all build-amd64 build-arm64 install uninstall status
 
 all: clean deps test build
@@ -30,6 +68,7 @@ help: ## Show this help message
 build: ## Build for current architecture
 	@echo "Building $(BINARY_NAME) for current architecture..."
 	$(GOBUILD) $(LDFLAGS) -o $(BINARY_NAME) mac2mqtt.go
+	$(call codesign_local,$(BINARY_NAME))
 	@echo "Build complete: $(BINARY_NAME)"
 
 build-all: build-amd64 build-arm64 ## Build for both Intel and ARM architectures
@@ -38,12 +77,14 @@ build-amd64: ## Build for Intel Mac (amd64)
 	@echo "Building $(BINARY_NAME) for Intel Mac (amd64)..."
 	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BINARY_NAME)-darwin-amd64 mac2mqtt.go
 	chmod +x $(BINARY_NAME)-darwin-amd64
+	$(call codesign_local,$(BINARY_NAME)-darwin-amd64)
 	@echo "Build complete: $(BINARY_NAME)-darwin-amd64"
 
 build-arm64: ## Build for Apple Silicon Mac (arm64)
 	@echo "Building $(BINARY_NAME) for Apple Silicon Mac (arm64)..."
 	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BINARY_NAME)-darwin-arm64 mac2mqtt.go
 	chmod +x $(BINARY_NAME)-darwin-arm64
+	$(call codesign_local,$(BINARY_NAME)-darwin-arm64)
 	@echo "Build complete: $(BINARY_NAME)-darwin-arm64"
 
 clean: ## Clean build artifacts
