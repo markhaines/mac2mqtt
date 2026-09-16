@@ -173,6 +173,16 @@ type Application struct {
 	reachableFn func() bool
 	newClientFn func(*mqtt.ClientOptions) mqtt.Client
 
+	// Host-state seams for everything the connect path reads by shelling out
+	// (osascript, ps, ioreg, system_profiler), under the same rules again. They
+	// let a test run connectHandler without any host command, so its timing
+	// does not depend on PATH or machine load.
+	volumeFn       func() int
+	muteFn         func() bool
+	caffeinateFn   func() bool
+	serialNumberFn func() string
+	modelFn        func() string
+
 	// Startup retry timing. Zero means StartupRetryBudget and
 	// StartupRetryInitialBackoff; tests shrink them.
 	startupRetryBudget  time.Duration
@@ -183,6 +193,41 @@ type Application struct {
 	// publishes a healthy startup makes still happen once it connects. It is
 	// only ever touched by the goroutine running Run, like app.client.
 	initialSetupPending bool
+}
+
+func (app *Application) currentVolume() int {
+	if app.volumeFn != nil {
+		return app.volumeFn()
+	}
+	return getCurrentVolume()
+}
+
+func (app *Application) muteStatus() bool {
+	if app.muteFn != nil {
+		return app.muteFn()
+	}
+	return getMuteStatus()
+}
+
+func (app *Application) caffeinateStatus() bool {
+	if app.caffeinateFn != nil {
+		return app.caffeinateFn()
+	}
+	return getCaffeinateStatus()
+}
+
+func (app *Application) serialNumber() string {
+	if app.serialNumberFn != nil {
+		return app.serialNumberFn()
+	}
+	return getSerialnumber()
+}
+
+func (app *Application) model() string {
+	if app.modelFn != nil {
+		return app.modelFn()
+	}
+	return getModel()
 }
 
 // mediaControlAvailable reports whether the media-control binary is installed.
@@ -1653,12 +1698,12 @@ func (app *Application) handlePlayPauseCommand(client mqtt.Client, topic, payloa
 }
 
 func (app *Application) updateVolume(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/volume", 0, false, strconv.Itoa(getCurrentVolume()))
+	token := client.Publish(app.getTopicPrefix()+"/status/volume", 0, false, strconv.Itoa(app.currentVolume()))
 	token.Wait()
 }
 
 func (app *Application) updateMute(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/mute", 0, false, strconv.FormatBool(getMuteStatus()))
+	token := client.Publish(app.getTopicPrefix()+"/status/mute", 0, false, strconv.FormatBool(app.muteStatus()))
 	token.Wait()
 }
 
@@ -1842,7 +1887,7 @@ func (app *Application) updateBattery(client mqtt.Client) {
 }
 
 func (app *Application) updateCaffeinateStatus(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/caffeinate", 0, false, strconv.FormatBool(getCaffeinateStatus()))
+	token := client.Publish(app.getTopicPrefix()+"/status/caffeinate", 0, false, strconv.FormatBool(app.caffeinateStatus()))
 	token.Wait()
 }
 
@@ -2371,10 +2416,10 @@ func (app *Application) setDevice(client mqtt.Client) {
 	}
 
 	device := map[string]interface{}{
-		"ids":  getSerialnumber(),
+		"ids":  app.serialNumber(),
 		"name": app.hostname,
 		"mf":   "Apple",
-		"mdl":  getModel(),
+		"mdl":  app.model(),
 	}
 
 	discoveryTopic := app.config.DiscoveryPrefix + "/device" + "/" + app.hostname + "/config"

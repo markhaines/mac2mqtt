@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,68 @@ import (
 // silently dead to Home Assistant until restarted, even though the network
 // check logged that the broker was reachable again.
 // ============================================================================
+
+// connectDeadline bounds every wait for a connect to finish. With the host
+// seams pinned the connect path does no host work and completes in
+// milliseconds, so this is a hang detector, not a performance budget.
+const connectDeadline = 10 * time.Second
+
+const (
+	pinnedSerial = "TESTSERIAL"
+	pinnedModel  = "Test Model"
+)
+
+// pinHost replaces every host command the connect path would run (volume,
+// mute, caffeinate, serial number, model) and media-control, so connectHandler
+// is deterministic whatever PATH is and however loaded the machine is.
+// Display brightness needs no pin: a test app has no displays, so
+// updateDisplayBrightness returns before calling betterdisplaycli.
+func pinHost(app *Application) *Application {
+	pinMediaControl(app, false)
+	app.volumeFn = func() int { return 42 }
+	app.muteFn = func() bool { return false }
+	app.caffeinateFn = func() bool { return false }
+	app.serialNumberFn = func() string { return pinnedSerial }
+	app.modelFn = func() string { return pinnedModel }
+	return app
+}
+
+// assertPinnedDevice proves the discovery payload came through the host seams
+// rather than real ioreg/system_profiler calls.
+func assertPinnedDevice(t *testing.T, ops []op) {
+	t.Helper()
+	idx := indexOf(ops, "publish", discoveryDest)
+	if idx < 0 {
+		t.Fatal("no discovery publish")
+	}
+	var doc struct {
+		Dev struct {
+			IDs string `json:"ids"`
+			Mdl string `json:"mdl"`
+		} `json:"dev"`
+	}
+	if err := json.Unmarshal(ops[idx].payload, &doc); err != nil {
+		t.Fatalf("discovery payload is not JSON: %v", err)
+	}
+	if doc.Dev.IDs != pinnedSerial || doc.Dev.Mdl != pinnedModel {
+		t.Errorf("discovery dev = ids %q mdl %q, want pinned %q %q: connect path bypassed the host seams",
+			doc.Dev.IDs, doc.Dev.Mdl, pinnedSerial, pinnedModel)
+	}
+	for _, topic := range []string{testPrefix + "/status/volume", testPrefix + "/status/mute", testPrefix + "/status/caffeinate"} {
+		i := indexOf(ops, "publish", topic)
+		if i < 0 {
+			t.Errorf("no publish to %s", topic)
+			continue
+		}
+		want := "false"
+		if topic == testPrefix+"/status/volume" {
+			want = "42"
+		}
+		if string(ops[i].payload) != want {
+			t.Errorf("%s = %q, want pinned %q", topic, ops[i].payload, want)
+		}
+	}
+}
 
 // waitUntil polls cond for at most d. Every recovery assertion is bounded by
 // it, so a regression fails the test rather than hanging it.
@@ -103,7 +166,7 @@ func offlineApp(t *testing.T, cfg *config) (*Application, *switchableBroker, *cl
 	t.Cleanup(func() { close(stop) })
 	f := &clientFactory{broker: broker, stop: stop}
 
-	app := pinMediaControl(connectTestApp(cfg), false)
+	app := pinHost(connectTestApp(cfg))
 	app.reachableFn = broker.up.Load
 	app.newClientFn = f.build
 	return app, broker, f
@@ -147,6 +210,7 @@ func assertHealthyConnect(t *testing.T, c *recoveringClient) {
 	if o := ops[aliveIdx]; !o.retained || o.qos != 0 || string(o.payload) != "online" {
 		t.Errorf("availability = retained %v qos %d payload %q, want retained qos 0 \"online\"", o.retained, o.qos, o.payload)
 	}
+	assertPinnedDevice(t, ops)
 }
 
 // The production bug: start offline, broker comes back, a later network check
@@ -177,7 +241,7 @@ func TestOfflineStartRecoversWhenBrokerBecomesReachable(t *testing.T) {
 			if app.client != mqtt.Client(c) {
 				t.Fatal("recovered client was not installed as app.client")
 			}
-			waitUntil(t, 2*time.Second, "recovered client to run connectHandler", func() bool {
+			waitUntil(t, connectDeadline, "recovered client to run connectHandler", func() bool {
 				return c.onConnects.Load() == 1
 			})
 			assertHealthyConnect(t, c)
@@ -205,7 +269,7 @@ func TestOfflineRecoveryNeverDuplicatesClient(t *testing.T) {
 		t.Fatalf("built %d clients, want 1", len(clients))
 	}
 	c := clients[0]
-	waitUntil(t, 2*time.Second, "connectHandler", func() bool { return c.onConnects.Load() == 1 })
+	waitUntil(t, connectDeadline, "connectHandler", func() bool { return c.onConnects.Load() == 1 })
 
 	// Flap reachability while the client exists: Paho owns reconnection from
 	// here, so no check may build or reconnect anything.
@@ -286,7 +350,7 @@ func TestStartupRetriesBrieflyUnreachableBroker(t *testing.T) {
 		t.Fatalf("startup built %d clients, want 1: a briefly unreachable broker sent startup offline", len(clients))
 	}
 	c := clients[0]
-	waitUntil(t, 2*time.Second, "connectHandler after startup retry", func() bool { return c.onConnects.Load() == 1 })
+	waitUntil(t, connectDeadline, "connectHandler after startup retry", func() bool { return c.onConnects.Load() == 1 })
 	assertHealthyConnect(t, c)
 	if !app.initialSetupPending {
 		t.Error("initial setup not left pending for the loop")
@@ -461,12 +525,26 @@ func (b *loopbackBroker) connections() []brokerConn {
 }
 
 // sessionComplete reports whether connection i has done the full connect path.
+// Discovery is not the end of connectHandler: the state publishes after it
+// must have arrived too, or an outage started now would cut them off.
 func (b *loopbackBroker) sessionComplete(i int) bool {
 	conns := b.connections()
-	return len(conns) > i &&
-		indexOf(conns[i].ops, "publish", aliveTopic) >= 0 &&
-		indexOf(conns[i].ops, "subscribe", commandWild) >= 0 &&
-		indexOf(conns[i].ops, "publish", discoveryDest) >= 0
+	if len(conns) <= i {
+		return false
+	}
+	for _, o := range []op{
+		{kind: "publish", topic: aliveTopic},
+		{kind: "subscribe", topic: commandWild},
+		{kind: "publish", topic: discoveryDest},
+		{kind: "publish", topic: testPrefix + "/status/volume"},
+		{kind: "publish", topic: testPrefix + "/status/mute"},
+		{kind: "publish", topic: testPrefix + "/status/caffeinate"},
+	} {
+		if indexOf(conns[i].ops, o.kind, o.topic) < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func TestOfflineRecoveryWithRealPahoAcrossRepeatedOutages(t *testing.T) {
@@ -475,7 +553,7 @@ func TestOfflineRecoveryWithRealPahoAcrossRepeatedOutages(t *testing.T) {
 
 	cfg := baseConfig()
 	cfg.IP, cfg.Port = host, port
-	app := pinMediaControl(connectTestApp(cfg), false)
+	app := pinHost(connectTestApp(cfg))
 
 	var built atomic.Int32
 	var client mqtt.Client
@@ -503,7 +581,7 @@ func TestOfflineRecoveryWithRealPahoAcrossRepeatedOutages(t *testing.T) {
 	if built.Load() != 1 {
 		t.Fatalf("built %d clients after the broker came up, want 1", built.Load())
 	}
-	waitUntil(t, 10*time.Second, "first session to complete the connect path", func() bool {
+	waitUntil(t, connectDeadline, "first session to complete the connect path", func() bool {
 		return broker.sessionComplete(0)
 	})
 
@@ -545,6 +623,9 @@ func TestOfflineRecoveryWithRealPahoAcrossRepeatedOutages(t *testing.T) {
 			if o := c.ops[aliveIdx]; !o.retained || o.qos != 0 || string(o.payload) != "online" {
 				t.Errorf("session %d availability = retained %v qos %d payload %q", i, o.retained, o.qos, o.payload)
 			}
+		}
+		if discIdx >= 0 {
+			assertPinnedDevice(t, c.ops)
 		}
 		if n := countOps(c.ops, "subscribe", commandWild); n != 1 {
 			t.Errorf("session %d subscribed to command/# %d times, want 1", i, n)
