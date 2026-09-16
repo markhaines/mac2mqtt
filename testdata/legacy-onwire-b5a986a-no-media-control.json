@@ -1,0 +1,91 @@
+{
+  "source_commit": "b5a986ad2b5cc76a6010ce455baa254b554a905d",
+  "variant": "no-media-control",
+  "media_control_available": false,
+  "connect_ops": [
+    {
+      "kind": "publish",
+      "topic": "homeassistant/device/test-host/config",
+      "qos": 0,
+      "retained": true
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/alive",
+      "qos": 0,
+      "retained": true,
+      "payload": "online"
+    },
+    {
+      "kind": "subscribe",
+      "topic": "mac2mqtt/test-host/command/#",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/volume",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/mute",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/caffeinate",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/user_activity",
+      "qos": 0,
+      "retained": false
+    }
+  ],
+  "discovery_payload": "{\n  \"availability_topic\": \"mac2mqtt/test-host/status/alive\",\n  \"cmps\": {\n    \"battery\": {\n      \"device_class\": \"battery\",\n      \"enabled_by_default\": false,\n      \"name\": \"Battery\",\n      \"p\": \"sensor\",\n      \"state_topic\": \"mac2mqtt/test-host/status/battery\",\n      \"unique_id\": \"test-host_battery\",\n      \"unit_of_measurement\": \"%\"\n    },\n    \"camera\": {\n      \"device_class\": \"running\",\n      \"icon\": \"mdi:camera\",\n      \"name\": \"Camera\",\n      \"p\": \"binary_sensor\",\n      \"payload_off\": \"OFF\",\n      \"payload_on\": \"ON\",\n      \"state_topic\": \"mac2mqtt/test-host/status/camera\",\n      \"unique_id\": \"test-host_camera\"\n    },\n    \"cpu_free_percent\": {\n      \"icon\": \"mdi:cpu-64-bit\",\n      \"name\": \"CPU Free Percent\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/cpu/free_percent\",\n      \"unique_id\": \"test-host_cpu_free_percent\",\n      \"unit_of_measurement\": \"%\"\n    },\n    \"cpu_used_percent\": {\n      \"icon\": \"mdi:cpu-64-bit\",\n      \"name\": \"CPU Used Percent\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/cpu/used_percent\",\n      \"unique_id\": \"test-host_cpu_used_percent\",\n      \"unit_of_measurement\": \"%\"\n    },\n    \"disk_free\": {\n      \"device_class\": \"data_size\",\n      \"icon\": \"mdi:harddisk\",\n      \"name\": \"Disk Free\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/disk/free\",\n      \"unique_id\": \"test-host_disk_free\",\n      \"unit_of_measurement\": \"B\"\n    },\n    \"disk_free_percent\": {\n      \"icon\": \"mdi:chart-pie\",\n      \"name\": \"Disk Free Percent\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/disk/free_percent\",\n      \"unique_id\": \"test-host_disk_free_percent\",\n      \"unit_of_measurement\": \"%\"\n    },\n    \"disk_total\": {\n      \"device_class\": \"data_size\",\n      \"icon\": \"mdi:harddisk\",\n      \"name\": \"Disk Total\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/disk/total\",\n      \"unique_id\": \"test-host_disk_total\",\n      \"unit_of_measurement\": \"B\"\n    },\n    \"disk_used\": {\n      \"device_class\": \"data_size\",\n      \"icon\": \"mdi:harddisk\",\n      \"name\": \"Disk Used\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/disk/used\",\n      \"unique_id\": \"test-host_disk_used\",\n      \"unit_of_measurement\": \"B\"\n    },\n    \"disk_used_percent\": {\n      \"icon\": \"mdi:chart-pie\",\n      \"name\": \"Disk Used Percent\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/disk/used_percent\",\n      \"unique_id\": \"test-host_disk_used_percent\",\n      \"unit_of_measurement\": \"%\"\n    },\n    \"displaysleep\": {\n      \"command_topic\": \"mac2mqtt/test-host/command/set\",\n      \"icon\": \"mdi:monitor-off\",\n      \"name\": \"Display Sleep\",\n      \"p\": \"button\",\n      \"payload_press\": \"displaysleep\",\n      \"unique_id\": \"test-host_displaysleep\"\n    },\n    \"displaywake\": {\n      \"command_topic\": \"mac2mqtt/test-host/command/set\",\n      \"icon\": \"mdi:monitor\",\n      \"name\": \"Display Wake\",\n      \"p\": \"button\",\n      \"payload_press\": \"displaywake\",\n      \"unique_id\": \"test-host_displaywake\"\n    },\n    \"idle_time_seconds\": {\n      \"device_class\": \"duration\",\n      \"icon\": \"mdi:timer-sand\",\n      \"name\": \"test-host User Idle Time\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/idle_time_seconds\",\n      \"unique_id\": \"test-host_idle_time_seconds\",\n      \"unit_of_measurement\": \"s\"\n    },\n    \"keepawake\": {\n      \"command_topic\": \"mac2mqtt/test-host/command/keepawake\",\n      \"icon\": \"mdi:coffee\",\n      \"name\": \"Keep Awake\",\n      \"p\": \"switch\",\n      \"payload_off\": \"false\",\n      \"payload_on\": \"true\",\n      \"state_topic\": \"mac2mqtt/test-host/status/caffeinate\",\n      \"unique_id\": \"test-host_keepwake\"\n    },\n    \"memory_free\": {\n      \"device_class\": \"data_size\",\n      \"icon\": \"mdi:memory\",\n      \"name\": \"Memory Free\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/memory/free\",\n      \"unique_id\": \"test-host_memory_free\",\n      \"unit_of_measurement\": \"B\"\n    },\n    \"memory_free_percent\": {\n      \"icon\": \"mdi:memory\",\n      \"name\": \"Memory Free Percent\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/memory/free_percent\",\n      \"unique_id\": \"test-host_memory_free_percent\",\n      \"unit_of_measurement\": \"%\"\n    },\n    \"memory_total\": {\n      \"device_class\": \"data_size\",\n      \"icon\": \"mdi:memory\",\n      \"name\": \"Memory Total\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/memory/total\",\n      \"unique_id\": \"test-host_memory_total\",\n      \"unit_of_measurement\": \"B\"\n    },\n    \"memory_used\": {\n      \"device_class\": \"data_size\",\n      \"icon\": \"mdi:memory\",\n      \"name\": \"Memory Used\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/memory/used\",\n      \"unique_id\": \"test-host_memory_used\",\n      \"unit_of_measurement\": \"B\"\n    },\n    \"memory_used_percent\": {\n      \"icon\": \"mdi:memory\",\n      \"name\": \"Memory Used Percent\",\n      \"p\": \"sensor\",\n      \"state_class\": \"measurement\",\n      \"state_topic\": \"mac2mqtt/test-host/status/memory/used_percent\",\n      \"unique_id\": \"test-host_memory_used_percent\",\n      \"unit_of_measurement\": \"%\"\n    },\n    \"microphone\": {\n      \"device_class\": \"running\",\n      \"icon\": \"mdi:microphone\",\n      \"name\": \"Microphone\",\n      \"p\": \"binary_sensor\",\n      \"payload_off\": \"OFF\",\n      \"payload_on\": \"ON\",\n      \"state_topic\": \"mac2mqtt/test-host/status/microphone\",\n      \"unique_id\": \"test-host_microphone\"\n    },\n    \"mute\": {\n      \"command_topic\": \"mac2mqtt/test-host/command/mute\",\n      \"icon\": \"mdi:volume-mute\",\n      \"name\": \"Mute\",\n      \"p\": \"switch\",\n      \"payload_off\": \"false\",\n      \"payload_on\": \"true\",\n      \"state_topic\": \"mac2mqtt/test-host/status/mute\",\n      \"unique_id\": \"test-host_mute\"\n    },\n    \"public_ip\": {\n      \"icon\": \"mdi:ip-network\",\n      \"name\": \"Public IP\",\n      \"p\": \"sensor\",\n      \"state_topic\": \"mac2mqtt/test-host/status/public_ip\",\n      \"unique_id\": \"test-host_public_ip\"\n    },\n    \"screensaver\": {\n      \"command_topic\": \"mac2mqtt/test-host/command/set\",\n      \"icon\": \"mdi:monitor-star\",\n      \"name\": \"Screensaver\",\n      \"p\": \"button\",\n      \"payload_press\": \"screensaver\",\n      \"unique_id\": \"test-host_screensaver\"\n    },\n    \"shutdown\": {\n      \"command_topic\": \"mac2mqtt/test-host/command/set\",\n      \"enabled_by_default\": false,\n      \"icon\": \"mdi:power\",\n      \"name\": \"Shutdown\",\n      \"p\": \"button\",\n      \"payload_press\": \"shutdown\",\n      \"unique_id\": \"test-host_shutdown\"\n    },\n    \"sleep\": {\n      \"command_topic\": \"mac2mqtt/test-host/command/set\",\n      \"icon\": \"mdi:sleep\",\n      \"name\": \"Sleep\",\n      \"p\": \"button\",\n      \"payload_press\": \"sleep\",\n      \"unique_id\": \"test-host_sleep\"\n    },\n    \"uptime_human\": {\n      \"icon\": \"mdi:clock-outline\",\n      \"name\": \"Uptime\",\n      \"p\": \"sensor\",\n      \"state_topic\": \"mac2mqtt/test-host/status/uptime/human\",\n      \"unique_id\": \"test-host_uptime_human\"\n    },\n    \"uptime_seconds\": {\n      \"device_class\": \"duration\",\n      \"icon\": \"mdi:clock-outline\",\n      \"name\": \"Uptime Seconds\",\n      \"p\": \"sensor\",\n      \"state_class\": \"total_increasing\",\n      \"state_topic\": \"mac2mqtt/test-host/status/uptime/seconds\",\n      \"unique_id\": \"test-host_uptime_seconds\",\n      \"unit_of_measurement\": \"s\"\n    },\n    \"user_activity\": {\n      \"device_class\": \"occupancy\",\n      \"icon\": \"mdi:account-check\",\n      \"name\": \"User Activity\",\n      \"p\": \"binary_sensor\",\n      \"payload_off\": \"inactive\",\n      \"payload_on\": \"active\",\n      \"state_topic\": \"mac2mqtt/test-host/status/user_activity\",\n      \"unique_id\": \"test-host_user_activity\"\n    },\n    \"volume\": {\n      \"command_topic\": \"mac2mqtt/test-host/command/volume\",\n      \"icon\": \"mdi:volume-high\",\n      \"max_value\": 100,\n      \"min_value\": 0,\n      \"mode\": \"slider\",\n      \"name\": \"Volume\",\n      \"p\": \"number\",\n      \"state_topic\": \"mac2mqtt/test-host/status/volume\",\n      \"step\": 1,\n      \"unique_id\": \"test-host_volume\"\n    }\n  },\n  \"dev\": {\n    \"ids\": \"\\u003cSERIAL\\u003e\",\n    \"mdl\": \"\\u003cMODEL\\u003e\",\n    \"mf\": \"Apple\",\n    \"name\": \"test-host\"\n  },\n  \"o\": {\n    \"name\": \"mac2mqtt\"\n  },\n  \"qos\": 2\n}",
+  "periodic_ops": [
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/volume",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/mute",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/microphone",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/camera",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/alive",
+      "qos": 0,
+      "retained": true,
+      "payload": "online"
+    }
+  ],
+  "will": {
+    "kind": "will",
+    "topic": "mac2mqtt/test-host/status/alive",
+    "qos": 0,
+    "retained": true,
+    "payload": "offline"
+  }
+}

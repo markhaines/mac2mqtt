@@ -86,6 +86,39 @@ func isMediaControlAvailable() bool {
 	return err == nil
 }
 
+// The two media-control seams. These exist so that tests can pin what would
+// otherwise be ambient environment: whether the media-control binary is
+// installed, and what it reports. That is what lets the compatibility
+// comparison run on a machine with media-control and on one without, rather
+// than being skipped on either. Production always uses the real
+// implementations, set here and never reassigned.
+//
+// They are read through the functions below rather than called directly,
+// because connectHandler starts background goroutines that read them while a
+// test may be restoring them. The mutex makes that safe; the read is an
+// uncontended RLock on paths that already spawn subprocesses.
+var (
+	mediaSeamMu             sync.RWMutex
+	mediaControlAvailableFn = isMediaControlAvailable
+	mediaInfoSourceFn       = getMediaInfo
+)
+
+// mediaControlAvailable reports whether the media-control binary is installed.
+func mediaControlAvailable() bool {
+	mediaSeamMu.RLock()
+	fn := mediaControlAvailableFn
+	mediaSeamMu.RUnlock()
+	return fn()
+}
+
+// mediaInfoSource reads the current media state.
+func mediaInfoSource() (*MediaInfo, error) {
+	mediaSeamMu.RLock()
+	fn := mediaInfoSourceFn
+	mediaSeamMu.RUnlock()
+	return fn()
+}
+
 // MediaInfo represents the current media playing information
 type MediaInfo struct {
 	Title       string `json:"title"`
@@ -247,8 +280,8 @@ func NewApplication() (*Application, error) {
 	}
 
 	// Initialize currentMediaState
-	if isMediaControlAvailable() {
-		mediaInfo, err := getMediaInfo()
+	if mediaControlAvailable() {
+		mediaInfo, err := mediaInfoSource()
 		if err == nil && mediaInfo != nil {
 			app.currentMediaState = *mediaInfo
 		} else {
@@ -657,7 +690,7 @@ func setDisplayBrightness(displayID string, brightness int) error {
 // getMediaInfo retrieves current media information using Media Control
 func getMediaInfo() (*MediaInfo, error) {
 	// Check if Media Control is available
-	if !isMediaControlAvailable() {
+	if !mediaControlAvailable() {
 		return nil, &MediaControlError{message: "Media Control is not installed or not accessible"}
 	}
 
@@ -734,7 +767,7 @@ func getMediaInfo() (*MediaInfo, error) {
 
 // updateMediaPlayer updates the MQTT topics with current media player information
 func (app *Application) updateMediaPlayer(client mqtt.Client) {
-	mediaInfo, err := getMediaInfo()
+	mediaInfo, err := mediaInfoSource()
 	if err != nil {
 		// Check if it's a Media Control error
 		if _, ok := err.(*MediaControlError); ok {
@@ -773,7 +806,7 @@ func (app *Application) updateMediaPlayer(client mqtt.Client) {
 
 // updateNowPlaying updates the now playing sensor with current media information
 func (app *Application) updateNowPlaying(client mqtt.Client) {
-	mediaInfo, err := getMediaInfo()
+	mediaInfo, err := mediaInfoSource()
 	if err != nil {
 		if _, ok := err.(*MediaControlError); ok {
 			log.Printf("Media Control is not available: %v", err)
@@ -832,7 +865,7 @@ func (app *Application) updateNowPlaying(client mqtt.Client) {
 
 // startMediaStream starts the media-control stream for real-time updates
 func (app *Application) startMediaStream(client mqtt.Client) {
-	if !isMediaControlAvailable() {
+	if !mediaControlAvailable() {
 		log.Println("Media Control not available - skipping media stream")
 		return
 	}
@@ -1201,7 +1234,7 @@ func (app *Application) connectHandler(client mqtt.Client) {
 	app.setDevice(client)
 
 	// Start media stream if not already running (for reconnections)
-	if isMediaControlAvailable() {
+	if mediaControlAvailable() {
 		go app.startMediaStream(client)
 	}
 
@@ -2250,7 +2283,7 @@ func (app *Application) setDevice(client mqtt.Client) {
 	components["idle_time_seconds"] = idleTime
 
 	// Add media control components if Media Control is available
-	if isMediaControlAvailable() {
+	if mediaControlAvailable() {
 		playPause := map[string]interface{}{
 			"p":             "button",
 			"name":          "Play/Pause",
@@ -2327,11 +2360,16 @@ func (app *Application) setDevice(client mqtt.Client) {
 	// QoS 0 and retained, exactly as before this feature existed. QoS must not
 	// be raised here: a user who drops in this binary without editing their
 	// config would get different on-wire behaviour, which the compatibility
-	// contract forbids. It also keeps this publish incapable of wedging
-	// startup, because Paho completes a QoS 0 token when the socket write
-	// completes (bounded by SetWriteTimeout) rather than on PUBACK, so a
-	// broker that accepts writes but never acknowledges cannot block the
-	// process from reaching its heartbeat loop.
+	// contract forbids.
+	//
+	// It also matters for startup. Run calls setDevice before entering the
+	// timer loop, and Paho completes a QoS 0 token once the socket write
+	// completes (bounded by SetWriteTimeout) rather than on PUBACK. At QoS 1
+	// this wait would instead depend on the broker acknowledging, so one that
+	// accepted writes but never replied would leave the process connected and
+	// subscribed yet never beating. This says nothing about the other waits on
+	// the connect path, such as connect retry or SUBACK, which are unchanged
+	// from before this feature.
 	token := client.Publish(discoveryTopic, 0, true, objectJSON)
 	token.Wait()
 	if err := token.Error(); err != nil {
@@ -2379,7 +2417,7 @@ func (app *Application) Run() error {
 
 	// Check Media Control availability
 	log.Println("=== CHECKING MEDIA CONTROL ===")
-	if isMediaControlAvailable() {
+	if mediaControlAvailable() {
 		log.Println("Media Control is available - Media player will be enabled")
 	} else {
 		log.Println("Media Control is not installed or not accessible")

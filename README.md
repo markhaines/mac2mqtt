@@ -145,9 +145,22 @@ keeps its last state and the device's availability. Its **Delete** button stays
 greyed out in that state, so deleting has to come last.
 
 1. Add the key to `mac2mqtt.yaml` and restart mac2mqtt.
-2. Confirm the new retained discovery payload no longer lists the sensor, for
-   example with
-   `mosquitto_sub -h <broker> -t 'homeassistant/device/<hostname>/config' -C 1`.
+2. Confirm the new **retained** discovery payload no longer lists the sensor:
+
+   ```sh
+   mosquitto_sub -h <broker> -t '<discovery_prefix>/device/<hostname>/config' \
+       --retained-only -W 5
+   ```
+
+   `--retained-only` is what makes this meaningful: it ignores live traffic, so
+   anything printed really is the retained payload a newly-started Home
+   Assistant would receive. `-W 5` exits after five seconds, so nothing printed
+   means nothing is retained on that topic.
+
+   Substitute `<discovery_prefix>` with your `discovery_prefix` setting
+   (`homeassistant` unless you changed it) and `<hostname>` with your
+   `hostname`. Add `-p <port>` for a non-default port, `-u <user> -P <pass>` if
+   the broker needs credentials, and for TLS `-p 8883 --cafile <ca.crt>`.
 3. Reload the MQTT integration (**Settings > Devices & Services > MQTT >
    ... > Reload**), or restart Home Assistant. This is the step that unloads
    the entity; skip it and the Delete button stays disabled.

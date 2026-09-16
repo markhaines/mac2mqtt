@@ -797,17 +797,22 @@ func TestAliveAndCommandUnaffectedInAllThreeKeyStates(t *testing.T) {
 }
 
 // ============================================================================
-// Backwards compatibility against the LEGACY fixture
+// Backwards compatibility against the LEGACY fixtures
 //
-// testdata/legacy-onwire-b5a986a.json records what main (b5a986a) actually put
+// testdata/legacy-onwire-b5a986a-*.json record what main (b5a986a) actually put
 // on the wire, captured by running that commit's own connectHandler under a
-// recording client. The generator is kept beside it as
-// legacy-capture-generator.go.txt.
+// recording client. See testdata/README.md for how to regenerate them.
 //
-// This is the point of the fixture: comparing the new code's default path
+// This is the point of the fixtures: comparing the new code's default path
 // against another run of the new code cannot detect a behaviour change, because
 // both sides move together. Only a baseline taken from main can fail when the
-// default path drifts, which is exactly what a QoS change on discovery did.
+// default path drifts.
+//
+// There are two variants because main publishes different components depending
+// on whether media-control is installed. The production probe is behind the
+// mediaControlAvailable variable, so these tests pin it and compare against the
+// matching fixture. That makes the comparison run in BOTH environments instead
+// of being skipped in either, on any machine, with or without media-control.
 // ============================================================================
 
 type legacyOp struct {
@@ -819,38 +824,85 @@ type legacyOp struct {
 }
 
 type legacyFixture struct {
-	Source                 string            `json:"source_commit"`
-	MediaControlAvailable  bool              `json:"media_control_available"`
-	ConnectOps             []legacyOp        `json:"connect_ops"`
-	DiscoveryComponentKeys []string          `json:"discovery_component_keys"`
-	DiscoveryAttrs         map[string]string `json:"discovery_attrs"`
-	PeriodicOps            []legacyOp        `json:"periodic_ops"`
-	Will                   legacyOp          `json:"will"`
+	Source                string     `json:"source_commit"`
+	Variant               string     `json:"variant"`
+	MediaControlAvailable bool       `json:"media_control_available"`
+	ConnectOps            []legacyOp `json:"connect_ops"`
+	DiscoveryPayload      string     `json:"discovery_payload"`
+	PeriodicOps           []legacyOp `json:"periodic_ops"`
+	Will                  legacyOp   `json:"will"`
 }
 
-func loadLegacyFixture(t *testing.T) legacyFixture {
+// loadLegacyFixture reads a variant. It never skips: a missing or unreadable
+// fixture is a failure, because a compatibility gate that can quietly vanish is
+// not a gate.
+func loadLegacyFixture(t *testing.T, variant string) legacyFixture {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("testdata", "legacy-onwire-b5a986a.json"))
+	name := "legacy-onwire-b5a986a-" + variant + ".json"
+	raw, err := os.ReadFile(filepath.Join("testdata", name))
 	if err != nil {
-		t.Fatalf("read legacy fixture: %v", err)
+		t.Fatalf("read legacy fixture %s: %v", name, err)
 	}
 	var f legacyFixture
 	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("parse legacy fixture: %v", err)
+		t.Fatalf("parse legacy fixture %s: %v", name, err)
 	}
-	// The fixture records which optional external tools were present when it
-	// was captured. Comparing against it on a machine configured differently
-	// would compare the environment, not the code.
-	if f.MediaControlAvailable != isMediaControlAvailable() {
-		t.Skipf("fixture captured with media-control available=%v, this machine has %v",
-			f.MediaControlAvailable, isMediaControlAvailable())
+	if f.Variant != variant {
+		t.Fatalf("fixture %s declares variant %q", name, f.Variant)
 	}
 	return f
 }
 
+// pinMediaControl forces both media-control seams for the duration of a test,
+// so the comparison depends on the fixture rather than on what happens to be
+// installed on the machine running it.
+//
+// Pinning the probe alone is not enough: the connect path also reads the
+// current media state, which really does execute the media-control binary. On a
+// machine without it that read fails and a different set of topics is
+// published, so the media state is pinned too. The fixtures were captured with
+// no media playing, which is what the nil return reproduces.
+func pinMediaControl(t *testing.T, available bool) {
+	t.Helper()
+
+	mediaSeamMu.Lock()
+	originalProbe := mediaControlAvailableFn
+	originalInfo := mediaInfoSourceFn
+	mediaControlAvailableFn = func() bool { return available }
+	mediaInfoSourceFn = func() (*MediaInfo, error) {
+		if !available {
+			return nil, &MediaControlError{message: "media-control is not installed"}
+		}
+		return nil, nil // installed, nothing playing
+	}
+	mediaSeamMu.Unlock()
+
+	t.Cleanup(func() {
+		mediaSeamMu.Lock()
+		mediaControlAvailableFn = originalProbe
+		mediaInfoSourceFn = originalInfo
+		mediaSeamMu.Unlock()
+	})
+}
+
+// legacyVariants is the matrix every fixture-backed test runs over. Both run
+// regardless of the host environment.
+func legacyVariants() []struct {
+	name      string
+	available bool
+} {
+	return []struct {
+		name      string
+		available bool
+	}{
+		{"with-media-control", true},
+		{"no-media-control", false},
+	}
+}
+
 // signature reduces an op to the on-wire attributes the compatibility contract
-// covers. Payloads carrying live system readings are excluded; the two that are
-// config-derived (availability and discovery) are handled separately.
+// covers. The discovery payload is compared separately and in full, because it
+// needs per-host normalisation first.
 func signature(o op) legacyOp {
 	l := legacyOp{Kind: o.kind, Topic: o.topic, QoS: o.qos, Retained: o.retained}
 	if o.topic == aliveTopic {
@@ -885,69 +937,159 @@ func diffOps(t *testing.T, label string, got, want []legacyOp) {
 	}
 }
 
+// normaliseDiscovery mirrors the generator: it replaces only the two values
+// that legitimately vary per host, so everything else is compared verbatim.
+// Kept deliberately identical to testdata/legacy-capture-generator.go.txt.
+func normaliseDiscovery(t *testing.T, raw []byte) string {
+	t.Helper()
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("discovery payload is not JSON: %v", err)
+	}
+	if dev, ok := doc["dev"].(map[string]interface{}); ok {
+		if _, present := dev["ids"]; present {
+			dev["ids"] = "<SERIAL>"
+		}
+		if _, present := dev["mdl"]; present {
+			dev["mdl"] = "<MODEL>"
+		}
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// diffDiscovery reports the first meaningful difference per component rather
+// than dumping two 9KB blobs, so a failure names what actually drifted.
+func diffDiscovery(t *testing.T, got, want string) {
+	t.Helper()
+	if got == want {
+		return
+	}
+
+	var g, w map[string]interface{}
+	if err := json.Unmarshal([]byte(got), &g); err != nil {
+		t.Fatalf("got payload not JSON: %v", err)
+	}
+	if err := json.Unmarshal([]byte(want), &w); err != nil {
+		t.Fatalf("fixture payload not JSON: %v", err)
+	}
+
+	// Top-level fields (availability_topic, discovery-level qos, dev, o).
+	for _, key := range []string{"availability_topic", "qos", "dev", "o"} {
+		gv, _ := json.Marshal(g[key])
+		wv, _ := json.Marshal(w[key])
+		if string(gv) != string(wv) {
+			t.Errorf("discovery %q differs from main\n got:  %s\n main: %s", key, gv, wv)
+		}
+	}
+
+	gc, _ := g["cmps"].(map[string]interface{})
+	wc, _ := w["cmps"].(map[string]interface{})
+
+	var missing, added []string
+	for k := range wc {
+		if _, ok := gc[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	for k := range gc {
+		if _, ok := wc[k]; !ok {
+			added = append(added, k)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(added)
+	if len(missing) > 0 {
+		t.Errorf("components published by main but missing now: %v", missing)
+	}
+	if len(added) > 0 {
+		t.Errorf("components published now but not by main: %v", added)
+	}
+
+	var keys []string
+	for k := range wc {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		gv, ok := gc[k]
+		if !ok {
+			continue
+		}
+		gb, _ := json.Marshal(gv)
+		wb, _ := json.Marshal(wc[k])
+		if string(gb) != string(wb) {
+			t.Errorf("discovery component %q differs from main\n got:  %s\n main: %s", k, gb, wb)
+		}
+	}
+
+	if !t.Failed() {
+		t.Errorf("discovery payload differs from main but no field-level difference was isolated\n got:  %s\n main: %s", got, want)
+	}
+}
+
 // With the keys absent, every on-wire attribute of the connect path must match
 // what main produced: same topics, same QoS, same retained flags, same
 // availability payload.
 //
-// Ordering is deliberately NOT compared here. Moving availability and the
-// subscription ahead of discovery is the one intentional deviation from main,
-// and it has its own dedicated tests
+// Ordering is deliberately NOT compared here, and it is the only exclusion.
+// Moving availability and the subscription ahead of discovery is the one
+// intentional deviation from main, and it has its own dedicated tests
 // (TestConnectPublishesAliveAndSubscribesBeforeDiscovery and
-// TestAliveNotDelayedBySlowDiscovery). Everything else must be identical.
+// TestAliveNotDelayedBySlowDiscovery).
 func TestDefaultPathMatchesLegacyOnWireBehaviour(t *testing.T) {
-	f := loadLegacyFixture(t)
+	for _, v := range legacyVariants() {
+		t.Run(v.name, func(t *testing.T) {
+			f := loadLegacyFixture(t, v.name)
+			pinMediaControl(t, v.available)
 
-	c := &fakeClient{}
-	connectTestApp(parseConfig(t, "")).connectHandler(c)
+			c := &fakeClient{}
+			connectTestApp(parseConfig(t, "")).connectHandler(c)
 
-	var got []legacyOp
-	for _, o := range c.snapshot() {
-		got = append(got, signature(o))
+			var got []legacyOp
+			for _, o := range c.snapshot() {
+				got = append(got, signature(o))
+			}
+			diffOps(t, "connect path with keys absent", got, f.ConnectOps)
+		})
 	}
-	diffOps(t, "connect path with keys absent", got, f.ConnectOps)
 }
 
-// The discovery payload must offer main's exact component set and the same
-// availability topic when the keys are absent.
-func TestDefaultDiscoveryMatchesLegacyComponents(t *testing.T) {
-	f := loadLegacyFixture(t)
+// The full discovery payload must match main's, field for field, once the two
+// per-host values are normalised. This covers state topics, command topics,
+// payload mappings, units, device classes, the discovery-level qos and the
+// availability wiring, none of which the operation-level comparison can see.
+func TestDefaultDiscoveryPayloadMatchesLegacy(t *testing.T) {
+	for _, v := range legacyVariants() {
+		t.Run(v.name, func(t *testing.T) {
+			f := loadLegacyFixture(t, v.name)
+			pinMediaControl(t, v.available)
 
-	msgs := discoveryFrom(t, testApp(parseConfig(t, "")))
-	final := msgs[len(msgs)-1]
+			c := &fakeClient{}
+			testApp(parseConfig(t, "")).setDevice(c)
 
-	var got []string
-	for k := range final.Components {
-		got = append(got, k)
-	}
-	sort.Strings(got)
-
-	want := append([]string(nil), f.DiscoveryComponentKeys...)
-	sort.Strings(want)
-
-	if len(got) != len(want) {
-		t.Errorf("component count %d, main had %d\n got:  %v\n main: %v", len(got), len(want), got, want)
-	}
-	missing := map[string]bool{}
-	for _, k := range want {
-		missing[k] = true
-	}
-	for _, k := range got {
-		delete(missing, k)
-	}
-	for k := range missing {
-		t.Errorf("component %q was published by main but is missing with the keys absent", k)
-	}
-
-	if final.AvailabilityTopic != f.DiscoveryAttrs["availability_topic"] {
-		t.Errorf("availability_topic = %q, main had %q",
-			final.AvailabilityTopic, f.DiscoveryAttrs["availability_topic"])
+			var payload []byte
+			for _, o := range c.snapshot() {
+				if o.kind == "publish" && o.topic == discoveryDest {
+					payload = o.payload
+				}
+			}
+			if payload == nil {
+				t.Fatal("no discovery payload published")
+			}
+			diffDiscovery(t, normaliseDiscovery(t, payload), f.DiscoveryPayload)
+		})
 	}
 }
 
 // The 60s heartbeat must put the same operations on the wire as main's inline
-// tick body did, at the same QoS and retained flags.
+// tick body did. This does not depend on media-control, so it is asserted
+// unconditionally and can never be skipped.
 func TestPeriodicTickMatchesLegacyOnWireBehaviour(t *testing.T) {
-	f := loadLegacyFixture(t)
+	f := loadLegacyFixture(t, "with-media-control")
 
 	c := &fakeClient{}
 	testApp(parseConfig(t, "")).publishPeriodicStatus(c)
@@ -957,12 +1099,21 @@ func TestPeriodicTickMatchesLegacyOnWireBehaviour(t *testing.T) {
 		got = append(got, signature(o))
 	}
 	diffOps(t, "periodic tick with keys absent", got, f.PeriodicOps)
+
+	// The heartbeat is identical in both fixtures; assert that explicitly so a
+	// future media-control change cannot quietly alter it.
+	other := loadLegacyFixture(t, "no-media-control")
+	diffOps(t, "periodic tick is media-control independent", f.PeriodicOps, other.PeriodicOps)
 }
 
-// The last will must match main exactly, in every key state: it is the signal
-// the broker sends on this host's behalf when it dies.
+// The last will must match main exactly, in every key state. It does not depend
+// on media-control either, so this never skips.
 func TestWillMatchesLegacyInEveryKeyState(t *testing.T) {
-	f := loadLegacyFixture(t)
+	f := loadLegacyFixture(t, "with-media-control")
+	other := loadLegacyFixture(t, "no-media-control")
+	if f.Will != other.Will {
+		t.Fatalf("fixtures disagree on the will: %+v vs %+v", f.Will, other.Will)
+	}
 
 	for _, tc := range keyStates() {
 		t.Run(tc.name, func(t *testing.T) {
@@ -975,7 +1126,7 @@ func TestWillMatchesLegacyInEveryKeyState(t *testing.T) {
 				t.Fatal("will is not enabled")
 			}
 			if got != f.Will {
-				t.Errorf("will differs from main\ngot:  %+v\nmain: %+v", got, f.Will)
+				t.Errorf("will differs from main\n got:  %+v\n main: %+v", got, f.Will)
 			}
 		})
 	}
