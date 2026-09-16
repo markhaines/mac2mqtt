@@ -1,0 +1,136 @@
+{
+  "source_commit": "b5a986ad2b5cc76a6010ce455baa254b554a905d",
+  "media_control_available": true,
+  "connect_ops": [
+    {
+      "kind": "publish",
+      "topic": "homeassistant/device/test-host/config",
+      "qos": 0,
+      "retained": true
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/alive",
+      "qos": 0,
+      "retained": true,
+      "payload": "online"
+    },
+    {
+      "kind": "subscribe",
+      "topic": "mac2mqtt/test-host/command/#",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/volume",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/mute",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/caffeinate",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/now_playing",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/now_playing_attr",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/user_activity",
+      "qos": 0,
+      "retained": false
+    }
+  ],
+  "discovery_component_keys": [
+    "battery",
+    "camera",
+    "cpu_free_percent",
+    "cpu_used_percent",
+    "disk_free",
+    "disk_free_percent",
+    "disk_total",
+    "disk_used",
+    "disk_used_percent",
+    "displaysleep",
+    "displaywake",
+    "idle_time_seconds",
+    "keepawake",
+    "memory_free",
+    "memory_free_percent",
+    "memory_total",
+    "memory_used",
+    "memory_used_percent",
+    "microphone",
+    "mute",
+    "now_playing",
+    "playpause",
+    "public_ip",
+    "screensaver",
+    "shutdown",
+    "sleep",
+    "uptime_human",
+    "uptime_seconds",
+    "user_activity",
+    "volume"
+  ],
+  "discovery_attrs": {
+    "availability_topic": "mac2mqtt/test-host/status/alive"
+  },
+  "periodic_ops": [
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/volume",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/mute",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/microphone",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/camera",
+      "qos": 0,
+      "retained": false
+    },
+    {
+      "kind": "publish",
+      "topic": "mac2mqtt/test-host/status/alive",
+      "qos": 0,
+      "retained": true,
+      "payload": "online"
+    }
+  ],
+  "will": {
+    "kind": "will",
+    "topic": "mac2mqtt/test-host/status/alive",
+    "qos": 0,
+    "retained": true,
+    "payload": "offline"
+  }
+}

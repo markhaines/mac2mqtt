@@ -1,0 +1,154 @@
+package main
+
+// Generates the legacy on-wire fixture by running the UNMODIFIED code from
+// b5a986a under a recording MQTT client. Run with:
+//   go test -run TestGenerateLegacyFixture -v
+// Output is written to legacy-fixture.json.
+
+import (
+	"encoding/json"
+	"os"
+	"sort"
+	"testing"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+type capOp struct {
+	Kind     string `json:"kind"`
+	Topic    string `json:"topic"`
+	QoS      byte   `json:"qos"`
+	Retained bool   `json:"retained"`
+	Payload  string `json:"payload,omitempty"`
+}
+
+type capToken struct{}
+
+func (capToken) Wait() bool                     { return true }
+func (capToken) WaitTimeout(time.Duration) bool { return true }
+func (capToken) Done() <-chan struct{}          { ch := make(chan struct{}); close(ch); return ch }
+func (capToken) Error() error                   { return nil }
+
+type capClient struct{ ops []capOp }
+
+func (c *capClient) IsConnected() bool      { return true }
+func (c *capClient) IsConnectionOpen() bool { return true }
+func (c *capClient) Connect() mqtt.Token    { return capToken{} }
+func (c *capClient) Disconnect(uint)        {}
+func (c *capClient) Publish(topic string, qos byte, retained bool, payload interface{}) mqtt.Token {
+	var b []byte
+	switch v := payload.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	}
+	c.ops = append(c.ops, capOp{"publish", topic, qos, retained, string(b)})
+	return capToken{}
+}
+func (c *capClient) Subscribe(topic string, qos byte, _ mqtt.MessageHandler) mqtt.Token {
+	c.ops = append(c.ops, capOp{Kind: "subscribe", Topic: topic, QoS: qos})
+	return capToken{}
+}
+func (c *capClient) SubscribeMultiple(map[string]byte, mqtt.MessageHandler) mqtt.Token {
+	return capToken{}
+}
+func (c *capClient) Unsubscribe(...string) mqtt.Token        { return capToken{} }
+func (c *capClient) AddRoute(string, mqtt.MessageHandler)    {}
+func (c *capClient) OptionsReader() mqtt.ClientOptionsReader { return mqtt.ClientOptionsReader{} }
+
+type fixture struct {
+	Source                 string            `json:"source_commit"`
+	MediaControlAvailable  bool              `json:"media_control_available"`
+	Ops                    []capOp           `json:"connect_ops"`
+	DiscoveryComponentKeys []string          `json:"discovery_component_keys"`
+	DiscoveryAttrs         map[string]string `json:"discovery_attrs"`
+	PeriodicOps            []capOp           `json:"periodic_ops"`
+	Will                   capOp             `json:"will"`
+}
+
+func TestGenerateLegacyFixture(t *testing.T) {
+	app := &Application{
+		config: &config{
+			IP: "192.168.10.1", Port: "1883",
+			Hostname: "test-host", Topic: "mac2mqtt",
+			DiscoveryPrefix: "homeassistant",
+		},
+		hostname: "test-host",
+		topic:    "mac2mqtt/test-host",
+	}
+	// Neutralise the background workers with their own production CAS guards.
+	app.activityMonitorStarted.Store(true)
+	app.mediaStreamStarted.Store(true)
+
+	c := &capClient{}
+	app.connectHandler(c)
+
+	// Discovery component keys and payload-level attributes.
+	var keys []string
+	attrs := map[string]string{}
+	for _, o := range c.ops {
+		if o.Topic != "homeassistant/device/test-host/config" {
+			continue
+		}
+		var d struct {
+			Cmps              map[string]json.RawMessage `json:"cmps"`
+			AvailabilityTopic string                     `json:"availability_topic"`
+			QoS               int                        `json:"qos"`
+		}
+		if err := json.Unmarshal([]byte(o.Payload), &d); err != nil {
+			t.Fatalf("legacy discovery payload not JSON: %v", err)
+		}
+		keys = keys[:0]
+		for k := range d.Cmps {
+			keys = append(keys, k)
+		}
+		attrs["availability_topic"] = d.AvailabilityTopic
+	}
+	sort.Strings(keys)
+
+	// The periodic tick body, as main wrote it inline in the select loop.
+	pc := &capClient{}
+	app.updateVolume(pc)
+	app.updateMute(pc)
+	app.updateMediaDevices(pc)
+	pc.Publish(app.getTopicPrefix()+"/status/alive", 0, true, "online")
+
+	// Strip payloads from ops that carry live system readings, keeping only
+	// the ones that are config-derived and therefore stable.
+	stable := func(ops []capOp) []capOp {
+		out := make([]capOp, 0, len(ops))
+		for _, o := range ops {
+			if o.Topic != "mac2mqtt/test-host/status/alive" &&
+				o.Topic != "homeassistant/device/test-host/config" {
+				o.Payload = ""
+			}
+			if o.Topic == "homeassistant/device/test-host/config" {
+				o.Payload = "" // machine-specific (serial, model)
+			}
+			out = append(out, o)
+		}
+		return out
+	}
+
+	f := fixture{
+		Source:                 "b5a986ad2b5cc76a6010ce455baa254b554a905d",
+		MediaControlAvailable:  isMediaControlAvailable(),
+		Ops:                    stable(c.ops),
+		DiscoveryComponentKeys: append([]string(nil), keys...),
+		DiscoveryAttrs:         attrs,
+		PeriodicOps:            stable(pc.ops),
+		Will:                   capOp{"will", app.getTopicPrefix() + "/status/alive", 0, true, "offline"},
+	}
+
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("legacy-fixture.json", append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("wrote fixture: %d connect ops, %d periodic ops, %d components",
+		len(f.Ops), len(f.PeriodicOps), len(f.DiscoveryComponentKeys))
+}

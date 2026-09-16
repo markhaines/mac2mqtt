@@ -1343,20 +1343,32 @@ func (app *Application) publishPeriodicStatus(client mqtt.Client) {
 	app.updateVolume(client)
 	app.updateMute(client)
 	app.updateMediaDevices(client)
-	app.publishAlive(client)
+	app.publishAliveAsync(client)
 }
 
-// publishAlive publishes the retained availability message. It is deliberately
-// free of any dependency on sensor configuration or discovery state: every
-// configuration publishes exactly the same retained payload to the same topic.
+// aliveTopic is the availability topic. Both publishers go through it so the
+// two can never drift apart.
+func (app *Application) aliveTopic() string {
+	return app.getTopicPrefix() + "/status/alive"
+}
+
+// publishAliveAsync is the 60s heartbeat publish: fire and forget, no token
+// wait and no success log, matching the behaviour before this feature existed.
+// A synchronous wait here would put the timer loop at the mercy of the broker,
+// and a success line every 60 seconds is exactly the log noise this change
+// exists to remove.
+func (app *Application) publishAliveAsync(client mqtt.Client) {
+	client.Publish(app.aliveTopic(), 0, true, "online")
+}
+
+// publishAlive is the connect-time availability publish: retained, waited on
+// and logged once, as it was before. It is deliberately free of any dependency
+// on sensor configuration or discovery state, so every configuration publishes
+// the same retained payload to the same topic.
 func (app *Application) publishAlive(client mqtt.Client) {
-	topic := app.getTopicPrefix() + "/status/alive"
+	topic := app.aliveTopic()
 	token := client.Publish(topic, 0, true, "online")
 	token.Wait()
-	if err := token.Error(); err != nil {
-		log.Printf("Failed to publish availability to %s: %v", topic, err)
-		return
-	}
 	log.Println("Sending 'online' to topic: " + topic)
 }
 
@@ -2312,11 +2324,15 @@ func (app *Application) setDevice(client mqtt.Client) {
 		return
 	}
 
-	// QoS 1 with a checked token: this payload is what creates and removes
-	// entities in Home Assistant, so a silently dropped publish leaves the
-	// registry disagreeing with the config. Failure is logged and tolerated,
-	// never fatal, because availability and commands do not depend on it.
-	token := client.Publish(discoveryTopic, 1, true, objectJSON)
+	// QoS 0 and retained, exactly as before this feature existed. QoS must not
+	// be raised here: a user who drops in this binary without editing their
+	// config would get different on-wire behaviour, which the compatibility
+	// contract forbids. It also keeps this publish incapable of wedging
+	// startup, because Paho completes a QoS 0 token when the socket write
+	// completes (bounded by SetWriteTimeout) rather than on PUBACK, so a
+	// broker that accepts writes but never acknowledges cannot block the
+	// process from reaching its heartbeat loop.
+	token := client.Publish(discoveryTopic, 0, true, objectJSON)
 	token.Wait()
 	if err := token.Error(); err != nil {
 		log.Printf("Failed to publish discovery config to %s: %v", discoveryTopic, err)

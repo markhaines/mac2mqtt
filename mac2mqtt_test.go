@@ -3,6 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -372,11 +375,25 @@ func TestAliveSurvivesDiscoveryFailure(t *testing.T) {
 	connectTestApp(baseConfig()).connectHandler(c)
 	ops := c.snapshot()
 
-	if indexOf(ops, "publish", aliveTopic) < 0 {
-		t.Error("availability was not published when discovery failed")
+	aliveIdx := indexOf(ops, "publish", aliveTopic)
+	subIdx := indexOf(ops, "subscribe", commandWild)
+	discIdx := indexOf(ops, "publish", discoveryDest)
+
+	if aliveIdx < 0 {
+		t.Fatal("availability was not published when discovery failed")
 	}
-	if indexOf(ops, "subscribe", commandWild) < 0 {
-		t.Error("command/# was not subscribed when discovery failed")
+	if subIdx < 0 {
+		t.Fatal("command/# was not subscribed when discovery failed")
+	}
+	// Presence alone would still pass with discovery ordered first, so assert
+	// the ordering here too: neither may be downstream of a failing publish.
+	if discIdx >= 0 && (aliveIdx > discIdx || subIdx > discIdx) {
+		t.Errorf("availability/subscription came after the failing discovery publish (alive %d, sub %d, discovery %d)",
+			aliveIdx, subIdx, discIdx)
+	}
+	if !ops[aliveIdx].retained || string(ops[aliveIdx].payload) != "online" {
+		t.Errorf("availability = retained %v payload %q, want retained true payload \"online\"",
+			ops[aliveIdx].retained, ops[aliveIdx].payload)
 	}
 }
 
@@ -581,8 +598,11 @@ func discoveryFrom(t *testing.T, app *Application) []discoveryPayload {
 		if !o.retained {
 			t.Error("discovery config must be published retained")
 		}
-		if o.qos != 1 {
-			t.Errorf("discovery published at QoS %d, want 1", o.qos)
+		// QoS 0, as main published it. Raising this is a default-path
+		// behaviour change; TestDefaultPathMatchesLegacyOnWireBehaviour is
+		// the authority, this is a fast local guard.
+		if o.qos != 0 {
+			t.Errorf("discovery published at QoS %d, want 0 (main's value)", o.qos)
 		}
 		var d discoveryPayload
 		if err := json.Unmarshal(o.payload, &d); err != nil {
@@ -776,44 +796,188 @@ func TestAliveAndCommandUnaffectedInAllThreeKeyStates(t *testing.T) {
 	}
 }
 
-// The core backwards-compatibility guarantee, stated as strictly as it can be
-// checked: a config file with the keys absent must behave identically to one
-// that sets them both to false. Dropping in a new binary without editing the
-// config changes nothing.
+// ============================================================================
+// Backwards compatibility against the LEGACY fixture
 //
-// Every operation is compared on kind, topic, QoS and retained flag. Payloads
-// are compared byte for byte for the two topics this change actually touches,
-// discovery and availability; the remaining payloads carry live system readings
-// (volume, mute, caffeinate) which are not config-derived and would only make
-// the test flaky.
-func TestAbsentKeysBehaveIdenticallyToExplicitFalse(t *testing.T) {
-	capture := func(extra string) []op {
-		c := &fakeClient{}
-		connectTestApp(parseConfig(t, extra)).connectHandler(c)
-		return c.snapshot()
+// testdata/legacy-onwire-b5a986a.json records what main (b5a986a) actually put
+// on the wire, captured by running that commit's own connectHandler under a
+// recording client. The generator is kept beside it as
+// legacy-capture-generator.go.txt.
+//
+// This is the point of the fixture: comparing the new code's default path
+// against another run of the new code cannot detect a behaviour change, because
+// both sides move together. Only a baseline taken from main can fail when the
+// default path drifts, which is exactly what a QoS change on discovery did.
+// ============================================================================
+
+type legacyOp struct {
+	Kind     string `json:"kind"`
+	Topic    string `json:"topic"`
+	QoS      byte   `json:"qos"`
+	Retained bool   `json:"retained"`
+	Payload  string `json:"payload,omitempty"`
+}
+
+type legacyFixture struct {
+	Source                 string            `json:"source_commit"`
+	MediaControlAvailable  bool              `json:"media_control_available"`
+	ConnectOps             []legacyOp        `json:"connect_ops"`
+	DiscoveryComponentKeys []string          `json:"discovery_component_keys"`
+	DiscoveryAttrs         map[string]string `json:"discovery_attrs"`
+	PeriodicOps            []legacyOp        `json:"periodic_ops"`
+	Will                   legacyOp          `json:"will"`
+}
+
+func loadLegacyFixture(t *testing.T) legacyFixture {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "legacy-onwire-b5a986a.json"))
+	if err != nil {
+		t.Fatalf("read legacy fixture: %v", err)
 	}
-
-	absent := capture("")
-	explicitFalse := capture("disable_media_devices: false\ndisable_display_brightness: false")
-
-	if len(absent) != len(explicitFalse) {
-		t.Fatalf("operation count differs: absent keys produced %d, explicit false produced %d",
-			len(absent), len(explicitFalse))
+	var f legacyFixture
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse legacy fixture: %v", err)
 	}
+	// The fixture records which optional external tools were present when it
+	// was captured. Comparing against it on a machine configured differently
+	// would compare the environment, not the code.
+	if f.MediaControlAvailable != isMediaControlAvailable() {
+		t.Skipf("fixture captured with media-control available=%v, this machine has %v",
+			f.MediaControlAvailable, isMediaControlAvailable())
+	}
+	return f
+}
 
-	for i := range absent {
-		a, b := absent[i], explicitFalse[i]
-		if a.kind != b.kind || a.topic != b.topic || a.qos != b.qos || a.retained != b.retained {
-			t.Errorf("op %d differs:\n absent: %s %s qos=%d retained=%v\n false:  %s %s qos=%d retained=%v",
-				i, a.kind, a.topic, a.qos, a.retained, b.kind, b.topic, b.qos, b.retained)
-			continue
+// signature reduces an op to the on-wire attributes the compatibility contract
+// covers. Payloads carrying live system readings are excluded; the two that are
+// config-derived (availability and discovery) are handled separately.
+func signature(o op) legacyOp {
+	l := legacyOp{Kind: o.kind, Topic: o.topic, QoS: o.qos, Retained: o.retained}
+	if o.topic == aliveTopic {
+		l.Payload = string(o.payload)
+	}
+	return l
+}
+
+func sortOps(in []legacyOp) []legacyOp {
+	out := append([]legacyOp(nil), in...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Topic != out[j].Topic {
+			return out[i].Topic < out[j].Topic
 		}
-		if a.topic == discoveryDest || a.topic == aliveTopic {
-			if string(a.payload) != string(b.payload) {
-				t.Errorf("payload on %s is not byte-identical:\n absent: %s\n false:  %s",
-					a.topic, a.payload, b.payload)
+		return out[i].Kind < out[j].Kind
+	})
+	return out
+}
+
+func diffOps(t *testing.T, label string, got, want []legacyOp) {
+	t.Helper()
+	g, w := sortOps(got), sortOps(want)
+	if len(g) != len(w) {
+		t.Errorf("%s: produced %d operations, main produced %d\n got:  %+v\n main: %+v",
+			label, len(g), len(w), g, w)
+		return
+	}
+	for i := range g {
+		if g[i] != w[i] {
+			t.Errorf("%s: operation differs from main\n got:  %+v\n main: %+v", label, g[i], w[i])
+		}
+	}
+}
+
+// With the keys absent, every on-wire attribute of the connect path must match
+// what main produced: same topics, same QoS, same retained flags, same
+// availability payload.
+//
+// Ordering is deliberately NOT compared here. Moving availability and the
+// subscription ahead of discovery is the one intentional deviation from main,
+// and it has its own dedicated tests
+// (TestConnectPublishesAliveAndSubscribesBeforeDiscovery and
+// TestAliveNotDelayedBySlowDiscovery). Everything else must be identical.
+func TestDefaultPathMatchesLegacyOnWireBehaviour(t *testing.T) {
+	f := loadLegacyFixture(t)
+
+	c := &fakeClient{}
+	connectTestApp(parseConfig(t, "")).connectHandler(c)
+
+	var got []legacyOp
+	for _, o := range c.snapshot() {
+		got = append(got, signature(o))
+	}
+	diffOps(t, "connect path with keys absent", got, f.ConnectOps)
+}
+
+// The discovery payload must offer main's exact component set and the same
+// availability topic when the keys are absent.
+func TestDefaultDiscoveryMatchesLegacyComponents(t *testing.T) {
+	f := loadLegacyFixture(t)
+
+	msgs := discoveryFrom(t, testApp(parseConfig(t, "")))
+	final := msgs[len(msgs)-1]
+
+	var got []string
+	for k := range final.Components {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+
+	want := append([]string(nil), f.DiscoveryComponentKeys...)
+	sort.Strings(want)
+
+	if len(got) != len(want) {
+		t.Errorf("component count %d, main had %d\n got:  %v\n main: %v", len(got), len(want), got, want)
+	}
+	missing := map[string]bool{}
+	for _, k := range want {
+		missing[k] = true
+	}
+	for _, k := range got {
+		delete(missing, k)
+	}
+	for k := range missing {
+		t.Errorf("component %q was published by main but is missing with the keys absent", k)
+	}
+
+	if final.AvailabilityTopic != f.DiscoveryAttrs["availability_topic"] {
+		t.Errorf("availability_topic = %q, main had %q",
+			final.AvailabilityTopic, f.DiscoveryAttrs["availability_topic"])
+	}
+}
+
+// The 60s heartbeat must put the same operations on the wire as main's inline
+// tick body did, at the same QoS and retained flags.
+func TestPeriodicTickMatchesLegacyOnWireBehaviour(t *testing.T) {
+	f := loadLegacyFixture(t)
+
+	c := &fakeClient{}
+	testApp(parseConfig(t, "")).publishPeriodicStatus(c)
+
+	var got []legacyOp
+	for _, o := range c.snapshot() {
+		got = append(got, signature(o))
+	}
+	diffOps(t, "periodic tick with keys absent", got, f.PeriodicOps)
+}
+
+// The last will must match main exactly, in every key state: it is the signal
+// the broker sends on this host's behalf when it dies.
+func TestWillMatchesLegacyInEveryKeyState(t *testing.T) {
+	f := loadLegacyFixture(t)
+
+	for _, tc := range keyStates() {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := testApp(parseConfig(t, tc.extra)).mqttClientOptions()
+			got := legacyOp{
+				Kind: "will", Topic: opts.WillTopic, QoS: opts.WillQos,
+				Retained: opts.WillRetained, Payload: string(opts.WillPayload),
 			}
-		}
+			if !opts.WillEnabled {
+				t.Fatal("will is not enabled")
+			}
+			if got != f.Will {
+				t.Errorf("will differs from main\ngot:  %+v\nmain: %+v", got, f.Will)
+			}
+		})
 	}
 }
 

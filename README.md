@@ -106,7 +106,7 @@ errors into the log for no benefit.
     disable_display_brightness: true
 
 `disable_media_devices: true` stops the camera and microphone from being polled
-and removes both binary sensors from Home Assistant.
+and stops both binary sensors being offered to Home Assistant.
 
 `disable_display_brightness: true` stops BetterDisplay CLI from being called at
 all. No display is enumerated at startup, no brightness is polled, and no
@@ -138,13 +138,26 @@ would work most of the time and silently fail the rest, which is worse than
 being told to do it yourself.
 
 So if you switch a sensor off on an installation that was already running it,
-delete the entities once by hand: **Settings > Devices & Services > MQTT**, pick
-the device, then delete the now-unavailable entities. This is a one-time step
-and they will not come back.
+remove the leftover entities once by hand. The order matters: dropping a
+component from the discovery payload does not unload an entity that Home
+Assistant has already set up, and until Home Assistant reloads it the entity
+keeps its last state and the device's availability. Its **Delete** button stays
+greyed out in that state, so deleting has to come last.
 
-This applies to both keys: `disable_media_devices` leaves a `Camera` and a
-`Microphone` binary sensor behind, and `disable_display_brightness` leaves one
-`<display> Brightness` number entity per display that was previously detected.
+1. Add the key to `mac2mqtt.yaml` and restart mac2mqtt.
+2. Confirm the new retained discovery payload no longer lists the sensor, for
+   example with
+   `mosquitto_sub -h <broker> -t 'homeassistant/device/<hostname>/config' -C 1`.
+3. Reload the MQTT integration (**Settings > Devices & Services > MQTT >
+   ... > Reload**), or restart Home Assistant. This is the step that unloads
+   the entity; skip it and the Delete button stays disabled.
+4. Now delete the leftover entities: **Settings > Devices & Services > MQTT**,
+   pick the device, open each stale entity and delete it.
+
+This is a one-time step and they will not come back. It applies to both keys:
+`disable_media_devices` leaves a `Camera` and a `Microphone` binary sensor
+behind, and `disable_display_brightness` leaves one `<display> Brightness`
+number entity per display that was previously detected.
 
 ### Running in the background
 
