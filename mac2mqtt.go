@@ -68,11 +68,13 @@ const (
 	StartupRetryInitialBackoff = 2 * time.Second
 	StartupRetryMaxBackoff     = 15 * time.Second
 	// StartupConnectWait bounds how long startup waits for the first MQTT
-	// connect to complete once the broker is reachable. It covers one full
-	// connect attempt (the 15s ConnectTimeout in mqttClientOptions) so a
-	// healthy broker is always connected before the main loop starts, exactly
-	// as before. Past it, startup carries on and Paho keeps connecting in the
-	// background; see getMQTTClient.
+	// connect to complete once the broker is reachable. It is longer than the
+	// 15s ConnectTimeout in mqttClientOptions, which bounds each dial and
+	// handshake, so a healthy broker is always connected before the main loop
+	// starts, exactly as before. A broker that stalls the handshake can outlast
+	// it: on a first connect Paho retries a failed MQTT 3.1.1 handshake as 3.1,
+	// so one stalled attempt takes up to two ConnectTimeouts. Past it, startup
+	// carries on and Paho keeps connecting in the background; see getMQTTClient.
 	StartupConnectWait = 20 * time.Second
 )
 
@@ -1401,7 +1403,7 @@ func (app *Application) mqttClientOptions() *mqtt.ClientOptions {
 	opts.SetClientID(app.hostname + "_mac2mqtt")
 	opts.SetKeepAlive(60 * time.Second)      // Send ping every 60 seconds
 	opts.SetPingTimeout(10 * time.Second)    // Shorter ping timeout for faster network change detection
-	opts.SetConnectTimeout(15 * time.Second) // Shorter connect timeout for network switching
+	opts.SetConnectTimeout(15 * time.Second) // Bounds the dial AND the CONNACK wait (Paho 1.4.2+), so a stalled handshake is retried
 	opts.SetAutoReconnect(true)              // Enable auto-reconnect
 	opts.SetConnectRetry(true)
 	opts.SetConnectRetryInterval(15 * time.Second) // Wait 15 seconds between retries (good for network switches)
@@ -1432,15 +1434,19 @@ func (app *Application) newMQTTClient() mqtt.Client {
 //
 // It waits at most StartupConnectWait for the first connect, never
 // indefinitely. With ConnectRetry set (see mqttClientOptions) Paho's connect
-// token only completes on success or after Disconnect, so an unbounded wait
-// hangs startup forever on a broker that accepts TCP but never completes the
-// MQTT connect: a stalled CONNACK, rejected credentials, a TLS mismatch. A
-// healthy broker completes well inside the bound, so startup is as before:
-// connected on return, and Run makes the initial publishes straight away. If
-// the wait runs out, the client stays installed and keeps connecting in Paho's
-// own retry loop, the one-off initial setup is left pending for the main loop
-// (as for a recovered offline start), and startup returns so the loop, its
-// timers and networkCheck run. connectHandler runs whenever the connect
+// token completes when a connect succeeds and in practice never otherwise: a
+// failed attempt (rejected credentials, a TLS mismatch, no CONNACK within
+// ConnectTimeout) is retried without completing it. So an unbounded wait
+// hangs startup for as long as the broker is reachable but refuses or stalls
+// the MQTT connect. Calling Disconnect is no way out either: Paho does not
+// interrupt the attempt in progress, it only stops retrying once that attempt
+// has failed and ConnectRetryInterval has passed. A healthy broker completes
+// well inside the bound, so startup is as before: connected on return, and
+// Run makes the initial publishes straight away. If the wait runs out, the
+// client stays installed and keeps connecting in Paho's own retry loop, the
+// one-off initial setup is left pending for the main loop (as for a recovered
+// offline start), and startup returns so the loop, its timers and
+// networkCheck run. connectHandler runs whenever the connect
 // succeeds, as on every connect.
 //
 // mqtt_ssl means TLS only. There used to be a fallback here that retried over
@@ -1471,8 +1477,10 @@ func (app *Application) getMQTTClient() error {
 		return nil
 	}
 	if err := token.Error(); err != nil {
-		// Only reachable if the connect was abandoned (Disconnect); the client
-		// is finished, so it is not installed.
+		// Not expected in practice: with ConnectRetry set Paho only fails the
+		// connect token when it stops retrying (no broker configured, or a
+		// Disconnect, which nothing here calls). If it does, the client is
+		// finished, so it is not installed.
 		return fmt.Errorf("failed to connect to MQTT broker: %w", err)
 	}
 
